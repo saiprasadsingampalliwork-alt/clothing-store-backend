@@ -1,0 +1,109 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Customer {
+  id           String   @id @default(cuid())
+  name         String
+  email        String   @unique
+  phone        String
+  passwordHash String
+  blocked      Boolean  @default(false)
+  addresses    Json     @default("[]")
+  createdAt    DateTime @default(now())
+  orders       Order[]
+}
+
+model Product {
+  slug            String  @id
+  name            String
+  price           Int
+  category        String
+  fabric          String
+  description     String
+  details         Json
+  care            Json
+  rating          Float
+  reviewCount     Int
+  isNew           Boolean @default(false)
+  reviews         Json
+  colors          Json
+  sizes           Json
+  stock           Json
+  status          String  @default("active")
+  salePrice       Int?
+  saleStart       String  @default("")
+  saleEnd         String  @default("")
+  metaTitle       String  @default("")
+  metaDescription String  @default("")
+}
+
+model Order {
+  id            String    @id
+  number        String    @unique
+  createdAt     DateTime  @default(now())
+  email         String
+  phone         String
+  address       Json
+  items         Json
+  delivery      String
+  payment       String
+  subtotal      Int
+  discount      Int
+  shipping      Int
+  codFee        Int
+  total         Int
+  coupon        String?
+  status        String
+  timeline      Json
+  notes         String    @default("")
+  trackingUrl   String?
+  shipment      Json?
+  returnRequest Json?
+  customerId    String?
+  customer      Customer? @relation(fields: [customerId], references: [id])
+}
+
+model Coupon {
+  code       String  @id
+  type       String
+  value      Int
+  minOrder   Int
+  usageLimit Int
+  used       Int     @default(0)
+  starts     String  @default("")
+  ends       String  @default("")
+  active     Boolean @default(true)
+}
+
+model Banner {
+  id       String @id
+  title    String
+  subtitle String @default("")
+  href     String @default("/shop")
+  starts   String @default("")
+  ends     String @default("")
+}
+
+model Staff {
+  id           String @id
+  name         String
+  email        String @unique
+  passwordHash String
+  role         String
+}
+
+model Setting {
+  id   String @id
+  data Json
+}
+
+model Sequence {
+  id    String @id
+  value Int
+}
