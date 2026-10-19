@@ -1,7 +1,8 @@
-import { BadRequestException, Body, Controller, Delete, Get, Inject, Param, Post, Put, Req, UnauthorizedException } from "@nestjs/common";
+import { BadRequestException, Body, Controller, Delete, Get, Inject, Param, Patch, Post, Put, Req, UnauthorizedException } from "@nestjs/common";
 import { compare, hash } from "bcryptjs";
 import type { Request } from "express";
 import { actorFrom, customerFrom, signToken } from "./auth";
+import { categorySlug } from "../../lib/catalog";
 import { presentProduct } from "./catalog.controller";
 import { publicCustomer } from "./customers.controller";
 import { OrdersService } from "./orders.service";
@@ -23,12 +24,13 @@ export class StudioController {
   async bootstrap(@Req() req: Request) {
     const staff = actorFrom(req);
     const customer = customerFrom(req);
-    const [products, coupons, banners, setting, sequence] = await Promise.all([
+    const [products, coupons, banners, setting, sequence, categories] = await Promise.all([
       this.prisma.product.findMany({ orderBy: { name: "asc" } }),
       this.prisma.coupon.findMany({ orderBy: { code: "asc" } }),
       this.prisma.banner.findMany(),
       this.prisma.setting.findUnique({ where: { id: "store" } }),
       this.prisma.sequence.findUnique({ where: { id: "order" } }),
+      this.prisma.category.findMany({ orderBy: [{ sort: "asc" }, { label: "asc" }] }),
     ]);
     const presented = products.map(presentProduct);
     const isStaff = staff?.kind === "staff";
@@ -51,6 +53,15 @@ export class StudioController {
       blockedEmails: customers.filter((entry) => entry.blocked).map((entry) => entry.email),
       staffList: staffList.map((member) => ({ id: member.id, name: member.name, email: member.email, role: member.role, password: "" })),
       user: me ? publicCustomer(me) : null,
+      products: presented.map((entry) => entry.product),
+      categories: categories.map((category) => ({
+        slug: category.slug,
+        label: category.label,
+        blurb: category.blurb,
+        image: category.image,
+        chart: category.chart === "lower" ? "lower" : "upper",
+      })),
+      bag: me ? { cart: me.cart ?? [], wishlist: me.wishlist ?? [] } : null,
     };
   }
 
@@ -95,10 +106,12 @@ export class StudioController {
   @Put("settings")
   async saveSettings(@Req() req: Request, @Body() body: Record<string, unknown>) {
     this.requireStaff(req);
+    const current = await this.orders.settings();
+    const next = { ...current, ...body };
     const saved = await this.prisma.setting.upsert({
       where: { id: "store" },
-      create: { id: "store", data: body as object },
-      update: { data: body as object },
+      create: { id: "store", data: next as object },
+      update: { data: next as object },
     });
     return saved.data;
   }
@@ -158,6 +171,54 @@ export class StudioController {
       create: { id, title: body.title, subtitle: body.subtitle ?? "", href: body.href ?? "/shop", starts: body.starts ?? "", ends: body.ends ?? "" },
       update: { title: body.title, subtitle: body.subtitle ?? "", href: body.href ?? "/shop", starts: body.starts ?? "", ends: body.ends ?? "" },
     });
+  }
+
+  @Post("categories")
+  async createCategory(@Req() req: Request, @Body() body: { label?: string; blurb?: string; image?: string; chart?: string }) {
+    this.requireStaff(req);
+    const label = (body.label ?? "").trim().replace(/\s+/g, " ");
+    const slug = categorySlug(label);
+    if (!slug || slug === "new" || slug === "all") throw new BadRequestException("Choose another name. New in stays a shop filter.");
+    const existing = await this.prisma.category.findUnique({ where: { slug } });
+    if (existing) throw new BadRequestException("A category with that name already exists.");
+    const sort = await this.prisma.category.count();
+    return this.prisma.category.create({
+      data: {
+        slug,
+        label,
+        blurb: (body.blurb ?? "").trim(),
+        image: (body.image ?? "").trim(),
+        chart: body.chart === "lower" ? "lower" : "upper",
+        sort,
+      },
+    });
+  }
+
+  @Patch("categories/:slug")
+  async updateCategory(@Req() req: Request, @Param("slug") slug: string, @Body() body: { label?: string; blurb?: string; image?: string; chart?: string }) {
+    this.requireStaff(req);
+    const existing = await this.prisma.category.findUnique({ where: { slug } });
+    if (!existing) throw new BadRequestException("Category not found.");
+    const label = (body.label ?? existing.label).trim().replace(/\s+/g, " ");
+    if (!label) throw new BadRequestException("A category needs a name.");
+    return this.prisma.category.update({
+      where: { slug },
+      data: {
+        label,
+        blurb: body.blurb === undefined ? existing.blurb : body.blurb.trim(),
+        image: body.image === undefined ? existing.image : body.image.trim(),
+        chart: body.chart === undefined ? existing.chart : body.chart === "lower" ? "lower" : "upper",
+      },
+    });
+  }
+
+  @Delete("categories/:slug")
+  async removeCategory(@Req() req: Request, @Param("slug") slug: string) {
+    this.requireStaff(req);
+    const used = await this.prisma.product.count({ where: { category: slug } });
+    if (used > 0) throw new BadRequestException(`${used} products still use this category. Move them first.`);
+    await this.prisma.category.delete({ where: { slug } });
+    return { ok: true };
   }
 
   @Delete("banners/:id")

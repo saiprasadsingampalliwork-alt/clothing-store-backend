@@ -1,3 +1,5 @@
+import { applyStoreSale, type SaleRules } from "../../lib/sale";
+
 export type CouponRecord = {
   code: string;
   type: "percent" | "fixed" | "free_shipping";
@@ -20,14 +22,15 @@ export type ShippingRules = {
   returnWindowDays: number;
 };
 
-export function livePrice(product: { price: number; salePrice: number | null; saleStart: string; saleEnd: string }) {
+export function livePrice(product: { price: number; salePrice: number | null; saleStart: string; saleEnd: string }, sale?: SaleRules) {
   const today = new Date().toISOString().slice(0, 10);
   const saleLive =
     typeof product.salePrice === "number" &&
     product.salePrice > 0 &&
     (!product.saleStart || today >= product.saleStart) &&
     (!product.saleEnd || today <= product.saleEnd);
-  return saleLive ? product.salePrice! : product.price;
+  const current = saleLive ? product.salePrice! : product.price;
+  return sale ? applyStoreSale(product.price, current, sale) : current;
 }
 
 export function evaluateCoupon(coupon: CouponRecord, subtotal: number): { ok: true; discount: number } | { ok: false; reason: string } {

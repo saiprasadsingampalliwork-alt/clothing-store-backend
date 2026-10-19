@@ -1,6 +1,6 @@
 import { hash } from "bcryptjs";
 import { PrismaClient, type Prisma } from "@prisma/client";
-import { products } from "../../lib/catalog";
+import { DEFAULT_CATEGORIES, productGender, products } from "../../lib/catalog";
 
 const prisma = new PrismaClient();
 
@@ -18,9 +18,25 @@ const settings = {
   businessName: "Earthen",
   gstin: "29AABCE1234F1Z5",
   pricesIncludeGst: true,
+  announcementEnabled: true,
+  announcementText: "",
+  announcementHref: "",
+  saleEnabled: false,
+  saleName: "",
+  salePercent: 0,
+  saleStart: "",
+  saleEnd: "",
 };
 
 async function main() {
+  for (const [index, category] of DEFAULT_CATEGORIES.entries()) {
+    await prisma.category.upsert({
+      where: { slug: category.slug },
+      create: { ...category, sort: index },
+      update: {},
+    });
+  }
+
   for (const product of products) {
     await prisma.product.upsert({
       where: { slug: product.slug },
@@ -29,6 +45,7 @@ async function main() {
         name: product.name,
         price: product.price,
         category: product.category,
+        gender: productGender(product),
         fabric: product.fabric,
         description: product.description,
         details: product.details,
@@ -41,8 +58,18 @@ async function main() {
         sizes: product.sizes,
         stock: product.stock,
         status: "active",
+        silhouette: product.silhouette,
+        origin: product.origin,
+        fit: product.fit,
+        model: product.model,
       },
-      update: {},
+      update: {
+        gender: productGender(product),
+        silhouette: product.silhouette,
+        origin: product.origin,
+        fit: product.fit,
+        model: product.model,
+      },
     });
   }
 

@@ -15,8 +15,19 @@ model Customer {
   passwordHash String
   blocked      Boolean  @default(false)
   addresses    Json     @default("[]")
+  cart         Json     @default("[]")
+  wishlist     Json     @default("[]")
   createdAt    DateTime @default(now())
   orders       Order[]
+}
+
+model Category {
+  slug  String @id
+  label String
+  blurb String @default("")
+  image String @default("")
+  chart String @default("upper")
+  sort  Int    @default(0)
 }
 
 model Product {
@@ -24,6 +35,7 @@ model Product {
   name            String
   price           Int
   category        String
+  gender          String  @default("unisex")
   fabric          String
   description     String
   details         Json
@@ -41,6 +53,11 @@ model Product {
   saleEnd         String  @default("")
   metaTitle       String  @default("")
   metaDescription String  @default("")
+  silhouette      String  @default("tee")
+  origin          String  @default("")
+  fit             String  @default("")
+  model           Json    @default("{\"heightCm\":178,\"size\":\"M\"}")
+  photos          Json    @default("[]")
 }
 
 model Order {
@@ -64,9 +81,22 @@ model Order {
   notes         String    @default("")
   trackingUrl   String?
   shipment      Json?
-  returnRequest Json?
-  customerId    String?
-  customer      Customer? @relation(fields: [customerId], references: [id])
+  returnRequest     Json?
+  razorpayOrderId   String?
+  razorpayPaymentId String?
+  customerId        String?
+  customer          Customer? @relation(fields: [customerId], references: [id])
+}
+
+model PaymentCheckout {
+  id              String    @id @default(cuid())
+  razorpayOrderId String    @unique
+  amountPaise     Int
+  payload         Json
+  paymentId       String?
+  orderId         String?
+  usedAt          DateTime?
+  createdAt       DateTime  @default(now())
 }
 
 model Coupon {
@@ -106,4 +136,25 @@ model Setting {
 model Sequence {
   id    String @id
   value Int
+}
+
+model RestockAlert {
+  id        String    @id @default(cuid())
+  slug      String
+  color     String
+  size      String
+  contact   String
+  emailedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@unique([slug, color, size, contact])
+}
+
+model PasswordReset {
+  id        String    @id @default(cuid())
+  email     String
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
 }

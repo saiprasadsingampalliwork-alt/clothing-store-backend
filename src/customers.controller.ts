@@ -1,13 +1,17 @@
 import { randomUUID } from "crypto";
-import { BadRequestException, Body, Controller, Delete, Get, Inject, Param, Patch, Post, Req, UnauthorizedException } from "@nestjs/common";
+import { BadRequestException, Body, Controller, Delete, Get, Inject, Param, Patch, Post, Put, Req, UnauthorizedException } from "@nestjs/common";
 import { hash, compare } from "bcryptjs";
 import type { Request } from "express";
 import { actorFrom, customerFrom, signToken } from "./auth";
+import { hashToken, MailService } from "./mail.service";
 import { PrismaService } from "./prisma.service";
 
 @Controller("customers")
 export class CustomersController {
-  constructor(@Inject(PrismaService) private readonly prisma: PrismaService) {}
+  constructor(
+    @Inject(PrismaService) private readonly prisma: PrismaService,
+    @Inject(MailService) private readonly mail: MailService,
+  ) {}
 
   @Post("register")
   async register(@Body() body: { name: string; email: string; phone: string; password: string }) {
@@ -37,12 +41,29 @@ export class CustomersController {
     return { token: signToken({ kind: "customer", email }), user: publicCustomer(customer) };
   }
 
+  @Post("forgot-password")
+  async forgot(@Body() body: { email: string }) {
+    const email = body.email?.trim().toLowerCase();
+    const customer = email ? await this.prisma.customer.findUnique({ where: { email } }) : null;
+    if (!customer) return { ok: true };
+    const reset = this.mail.newResetToken();
+    await this.prisma.passwordReset.deleteMany({ where: { email, usedAt: null } });
+    await this.prisma.passwordReset.create({ data: { email, tokenHash: reset.tokenHash, expiresAt: reset.expiresAt } });
+    const url = `${this.mail.appUrl()}/reset-password?token=${reset.token}`;
+    const result = await this.mail.passwordReset(email, url);
+    return { ok: true, previewUrl: result.skipped ? url : undefined };
+  }
+
   @Post("reset-password")
-  async reset(@Body() body: { email: string; password: string }) {
-    const email = body.email.trim().toLowerCase();
-    const customer = await this.prisma.customer.findUnique({ where: { email } });
-    if (!customer) throw new BadRequestException("No account uses that email.");
-    await this.prisma.customer.update({ where: { email }, data: { passwordHash: await hash(body.password, 10) } });
+  async reset(@Body() body: { token: string; password: string }) {
+    const token = body.token?.trim();
+    if (!token) throw new BadRequestException("This link is not valid. Request a new one.");
+    if (!body.password || body.password.length < 8) throw new BadRequestException("Use at least 8 characters.");
+    const row = await this.prisma.passwordReset.findUnique({ where: { tokenHash: hashToken(token) } });
+    if (!row || row.usedAt) throw new BadRequestException("This link is not valid. Request a new one.");
+    if (row.expiresAt.getTime() < Date.now()) throw new BadRequestException("This link has expired. Request a new one.");
+    await this.prisma.customer.update({ where: { email: row.email }, data: { passwordHash: await hash(body.password, 10) } });
+    await this.prisma.passwordReset.update({ where: { id: row.id }, data: { usedAt: new Date() } });
     return { ok: true };
   }
 
@@ -83,6 +104,15 @@ export class CustomersController {
     const addresses = ((customer.addresses as { id: string }[]) ?? []).filter((address) => address.id !== id);
     const updated = await this.prisma.customer.update({ where: { id: customer.id }, data: { addresses } });
     return publicCustomer(updated);
+  }
+
+  @Put("me/bag")
+  async saveBag(@Req() req: Request, @Body() body: { cart?: unknown; wishlist?: unknown }) {
+    const customer = await this.requireCustomer(req);
+    const cart = Array.isArray(body.cart) ? body.cart.slice(0, 40) : [];
+    const wishlist = Array.isArray(body.wishlist) ? body.wishlist.slice(0, 40) : [];
+    await this.prisma.customer.update({ where: { id: customer.id }, data: { cart, wishlist } });
+    return { cart, wishlist };
   }
 
   @Get()
