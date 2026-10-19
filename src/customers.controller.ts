@@ -78,7 +78,8 @@ export class CustomersController {
   async forgot(@Body() body: { email?: string; phone?: string }) {
     if (body.phone?.trim()) return this.forgotByPhone(body.phone);
     const email = body.email?.trim().toLowerCase();
-    const customer = email ? await this.prisma.customer.findUnique({ where: { email } }) : null;
+    if (!email) return { ok: true };
+    const customer = await this.prisma.customer.findUnique({ where: { email } });
     if (!customer) return { ok: true };
     const reset = this.mail.newResetToken();
     await this.prisma.passwordReset.deleteMany({ where: { email, purpose: "reset", usedAt: null } });

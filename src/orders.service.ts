@@ -4,7 +4,7 @@ import { PrismaService } from "./prisma.service";
 import { MailService, type MailItem, type MailOrder, type OrderMail } from "./mail.service";
 import { PaymentsService } from "./payments.service";
 import { WhatsAppService } from "./whatsapp.service";
-import { evaluateCoupon, livePrice, shippingFee, type ShippingRules } from "./pricing";
+import { evaluateCoupon, livePrice, shippingFee, type CouponRecord, type ShippingRules } from "./pricing";
 
 type ItemInput = { slug: string; color: string; size: string; quantity: number };
 
@@ -386,7 +386,8 @@ export class OrdersService {
       });
     }
     const subtotal = items.reduce((sum, item) => sum + item.price * item.quantity, 0);
-    const coupon = input.coupon ? await this.prisma.coupon.findUnique({ where: { code: input.coupon.trim().toUpperCase() } }) : null;
+    const stored = input.coupon ? await this.prisma.coupon.findUnique({ where: { code: input.coupon.trim().toUpperCase() } }) : null;
+    const coupon = stored && isCouponType(stored.type) ? { ...stored, type: stored.type } : null;
     const priced = coupon ? evaluateCoupon(coupon, subtotal) : undefined;
     if (coupon && priced && !priced.ok) throw new BadRequestException(priced.reason);
     const discount = priced && priced.ok && coupon?.type !== "free_shipping" ? priced.discount : 0;
@@ -441,6 +442,10 @@ export class OrdersService {
     if (!order) throw new NotFoundException("Order not found.");
     return order;
   }
+}
+
+function isCouponType(type: string): type is CouponRecord["type"] {
+  return type === "percent" || type === "fixed" || type === "free_shipping";
 }
 
 function statusMail(status: string): OrderMail | null {

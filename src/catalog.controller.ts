@@ -1,6 +1,6 @@
 import { BadRequestException, Body, Controller, ForbiddenException, Get, Inject, Param, Patch, Post, Query, Req, UnauthorizedException } from "@nestjs/common";
 import type { Request } from "express";
-import { categorySlug } from "../../lib/catalog";
+import { categorySlug } from "./category-slug";
 import { actorFrom, customerFrom } from "./auth";
 import { MailService } from "./mail.service";
 import { PrismaService } from "./prisma.service";
@@ -311,6 +311,8 @@ export class CatalogController {
   }
 }
 
+function numberOr(value: unknown, fallback: number): number;
+function numberOr(value: unknown, fallback: number | null): number | null;
 function numberOr(value: unknown, fallback: number | null) {
   if (value === undefined || value === null || value === "") return fallback;
   const parsed = Number(value);

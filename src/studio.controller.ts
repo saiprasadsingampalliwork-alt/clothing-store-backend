@@ -2,7 +2,7 @@ import { BadRequestException, Body, Controller, Delete, Get, Inject, Param, Patc
 import { compare, hash } from "bcryptjs";
 import type { Request } from "express";
 import { actorFrom, customerFrom, signToken } from "./auth";
-import { categorySlug } from "../../lib/catalog";
+import { categorySlug } from "./category-slug";
 import { presentProduct } from "./catalog.controller";
 import { publicCustomer } from "./customers.controller";
 import { OrdersService } from "./orders.service";
