@@ -15,8 +15,16 @@ async function bootstrap() {
     }),
   );
   app.use(urlencoded({ extended: true, limit: "1mb" }));
+  const origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    process.env.APP_URL,
+    ...(process.env.CORS_ORIGINS ?? "").split(","),
+  ]
+    .map((origin) => origin?.trim().replace(/\/$/, ""))
+    .filter((origin): origin is string => Boolean(origin));
   app.enableCors({
-    origin: ["http://localhost:3000", "http://127.0.0.1:3000"],
+    origin: [...new Set(origins)],
     allowedHeaders: ["content-type", "authorization", "x-customer-token"],
   });
   app.setGlobalPrefix("v1");
