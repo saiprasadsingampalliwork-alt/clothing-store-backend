@@ -15,9 +15,13 @@ model Customer {
   passwordHash String
   blocked      Boolean  @default(false)
   addresses    Json     @default("[]")
-  cart         Json     @default("[]")
-  wishlist     Json     @default("[]")
-  createdAt    DateTime @default(now())
+  cart                Json      @default("[]")
+  wishlist            Json      @default("[]")
+  cartUpdatedAt       DateTime?
+  wishlistUpdatedAt   DateTime?
+  cartRemindedKey     String    @default("")
+  wishlistRemindedKey String    @default("")
+  createdAt           DateTime  @default(now())
   orders       Order[]
 }
 
@@ -156,5 +160,7 @@ model PasswordReset {
   tokenHash String    @unique
   expiresAt DateTime
   usedAt    DateTime?
+  attempts  Int       @default(0)
+  purpose   String    @default("reset")
   createdAt DateTime  @default(now())
 }

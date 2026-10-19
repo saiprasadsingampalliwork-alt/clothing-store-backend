@@ -1,16 +1,22 @@
-import { randomUUID } from "crypto";
+import { randomInt, randomUUID, timingSafeEqual } from "crypto";
 import { BadRequestException, Body, Controller, Delete, Get, Inject, Param, Patch, Post, Put, Req, UnauthorizedException } from "@nestjs/common";
 import { hash, compare } from "bcryptjs";
 import type { Request } from "express";
 import { actorFrom, customerFrom, signToken } from "./auth";
 import { hashToken, MailService } from "./mail.service";
 import { PrismaService } from "./prisma.service";
+import { cartKey, wishlistKey } from "./nudges.service";
+import { WhatsAppService } from "./whatsapp.service";
+
+const CODE_MINUTES = 10;
+const CODE_ATTEMPTS = 5;
 
 @Controller("customers")
 export class CustomersController {
   constructor(
     @Inject(PrismaService) private readonly prisma: PrismaService,
     @Inject(MailService) private readonly mail: MailService,
+    @Inject(WhatsAppService) private readonly whatsapp: WhatsAppService,
   ) {}
 
   @Post("register")
@@ -41,13 +47,41 @@ export class CustomersController {
     return { token: signToken({ kind: "customer", email }), user: publicCustomer(customer) };
   }
 
+  @Post("login-code")
+  async loginCode(@Body() body: { phone?: string }) {
+    const phone = nationalMobile(body.phone || "");
+    if (!phone) throw new BadRequestException("Enter a 10-digit mobile number.");
+    const matches = await this.prisma.customer.findMany({ where: { phone } });
+    if (matches.length > 1) throw new BadRequestException("That mobile is on more than one account. Sign in with email.");
+    if (matches.length === 0) throw new BadRequestException("No account uses that mobile.");
+    const customer = matches[0];
+    if (customer.blocked) throw new BadRequestException("This account is blocked. Write to the studio if this is a mistake.");
+    await this.prisma.passwordReset.deleteMany({ where: { email: customer.email, purpose: "login", usedAt: null } });
+    const code = await this.saveCode(customer.email, "login");
+    const result = await this.whatsapp.signInCode(phone, code);
+    return { ok: true, previewCode: result.skipped ? code : undefined };
+  }
+
+  @Post("login-code/verify")
+  async loginWithCode(@Body() body: { phone?: string; code?: string }) {
+    const phone = nationalMobile(body.phone || "");
+    if (!phone) throw new BadRequestException("That code is not valid. Request a new one.");
+    const matches = await this.prisma.customer.findMany({ where: { phone } });
+    if (matches.length !== 1) throw new BadRequestException("That code is not valid. Request a new one.");
+    const customer = matches[0];
+    if (customer.blocked) throw new BadRequestException("This account is blocked. Write to the studio if this is a mistake.");
+    await this.matchCode(customer.email, "login", body.code);
+    return { token: signToken({ kind: "customer", email: customer.email }), user: publicCustomer(customer) };
+  }
+
   @Post("forgot-password")
-  async forgot(@Body() body: { email: string }) {
+  async forgot(@Body() body: { email?: string; phone?: string }) {
+    if (body.phone?.trim()) return this.forgotByPhone(body.phone);
     const email = body.email?.trim().toLowerCase();
     const customer = email ? await this.prisma.customer.findUnique({ where: { email } }) : null;
     if (!customer) return { ok: true };
     const reset = this.mail.newResetToken();
-    await this.prisma.passwordReset.deleteMany({ where: { email, usedAt: null } });
+    await this.prisma.passwordReset.deleteMany({ where: { email, purpose: "reset", usedAt: null } });
     await this.prisma.passwordReset.create({ data: { email, tokenHash: reset.tokenHash, expiresAt: reset.expiresAt } });
     const url = `${this.mail.appUrl()}/reset-password?token=${reset.token}`;
     const result = await this.mail.passwordReset(email, url);
@@ -55,12 +89,13 @@ export class CustomersController {
   }
 
   @Post("reset-password")
-  async reset(@Body() body: { token: string; password: string }) {
+  async reset(@Body() body: { token?: string; phone?: string; code?: string; password: string }) {
+    if (!body.password || body.password.length < 8) throw new BadRequestException("Use at least 8 characters.");
+    if (body.phone?.trim()) return this.resetWithCode(body.phone, body.code, body.password);
     const token = body.token?.trim();
     if (!token) throw new BadRequestException("This link is not valid. Request a new one.");
-    if (!body.password || body.password.length < 8) throw new BadRequestException("Use at least 8 characters.");
     const row = await this.prisma.passwordReset.findUnique({ where: { tokenHash: hashToken(token) } });
-    if (!row || row.usedAt) throw new BadRequestException("This link is not valid. Request a new one.");
+    if (!row || row.usedAt || row.purpose !== "reset") throw new BadRequestException("This link is not valid. Request a new one.");
     if (row.expiresAt.getTime() < Date.now()) throw new BadRequestException("This link has expired. Request a new one.");
     await this.prisma.customer.update({ where: { email: row.email }, data: { passwordHash: await hash(body.password, 10) } });
     await this.prisma.passwordReset.update({ where: { id: row.id }, data: { usedAt: new Date() } });
@@ -111,7 +146,23 @@ export class CustomersController {
     const customer = await this.requireCustomer(req);
     const cart = Array.isArray(body.cart) ? body.cart.slice(0, 40) : [];
     const wishlist = Array.isArray(body.wishlist) ? body.wishlist.slice(0, 40) : [];
-    await this.prisma.customer.update({ where: { id: customer.id }, data: { cart, wishlist } });
+    const nextCartKey = cartKey(cart);
+    const nextWishKey = wishlistKey(wishlist);
+    const cartChanged = nextCartKey !== cartKey(customer.cart);
+    const wishChanged = nextWishKey !== wishlistKey(customer.wishlist);
+    await this.prisma.customer.update({
+      where: { id: customer.id },
+      data: {
+        cart,
+        wishlist,
+        ...(cartChanged || (nextCartKey && !customer.cartUpdatedAt)
+          ? { cartUpdatedAt: nextCartKey ? new Date() : null, cartRemindedKey: cartChanged ? "" : customer.cartRemindedKey }
+          : {}),
+        ...(wishChanged || (nextWishKey && !customer.wishlistUpdatedAt)
+          ? { wishlistUpdatedAt: nextWishKey ? new Date() : null, wishlistRemindedKey: wishChanged ? "" : customer.wishlistRemindedKey }
+          : {}),
+      },
+    });
     return { cart, wishlist };
   }
 
@@ -147,6 +198,67 @@ export class CustomersController {
     return publicCustomer(updated);
   }
 
+  private async forgotByPhone(raw: string) {
+    const phone = nationalMobile(raw);
+    if (!phone) throw new BadRequestException("Enter a 10-digit mobile number.");
+    const matches = await this.prisma.customer.findMany({ where: { phone } });
+    if (matches.length > 1) throw new BadRequestException("That mobile is on more than one account. Use the email link.");
+    if (matches.length === 0) return { ok: true };
+    const customer = matches[0];
+    await this.prisma.passwordReset.deleteMany({ where: { email: customer.email, purpose: "reset", usedAt: null } });
+    const code = await this.saveCode(customer.email, "reset");
+    const result = await this.whatsapp.passwordCode(phone, code);
+    return { ok: true, previewCode: result.skipped ? code : undefined };
+  }
+
+  private async saveCode(email: string, purpose: "reset" | "login") {
+    for (let tryNumber = 0; tryNumber < 5; tryNumber += 1) {
+      const code = String(randomInt(0, 1000000)).padStart(6, "0");
+      const tokenHash = hashToken(code);
+      const existing = await this.prisma.passwordReset.findUnique({ where: { tokenHash } });
+      if (existing && !existing.usedAt) continue;
+      if (existing) await this.prisma.passwordReset.delete({ where: { id: existing.id } });
+      await this.prisma.passwordReset.create({
+        data: { email, purpose, tokenHash, expiresAt: new Date(Date.now() + CODE_MINUTES * 60 * 1000) },
+      });
+      return code;
+    }
+    throw new BadRequestException("Could not send a code. Try again.");
+  }
+
+  private async resetWithCode(rawPhone: string, rawCode: string | undefined, password: string) {
+    const phone = nationalMobile(rawPhone);
+    if (!phone) throw new BadRequestException("That code is not valid. Request a new one.");
+    const matches = await this.prisma.customer.findMany({ where: { phone } });
+    if (matches.length !== 1) throw new BadRequestException("That code is not valid. Request a new one.");
+    const row = await this.matchCode(matches[0].email, "reset", rawCode);
+    await this.prisma.customer.update({ where: { email: row.email }, data: { passwordHash: await hash(password, 10) } });
+    return { ok: true };
+  }
+
+  private async matchCode(email: string, purpose: "reset" | "login", rawCode: string | undefined) {
+    const code = (rawCode || "").replace(/\D/g, "");
+    if (!/^\d{6}$/.test(code)) throw new BadRequestException("That code is not valid. Request a new one.");
+    const row = await this.prisma.passwordReset.findFirst({
+      where: { email, purpose, usedAt: null },
+      orderBy: { createdAt: "desc" },
+    });
+    if (!row) throw new BadRequestException("That code is not valid. Request a new one.");
+    if (row.expiresAt.getTime() < Date.now() || row.attempts >= CODE_ATTEMPTS) {
+      throw new BadRequestException("That code has expired. Request a new one.");
+    }
+    if (!sameHash(hashToken(code), row.tokenHash)) {
+      const attempts = row.attempts + 1;
+      await this.prisma.passwordReset.update({
+        where: { id: row.id },
+        data: { attempts, usedAt: attempts >= CODE_ATTEMPTS ? new Date() : null },
+      });
+      throw new BadRequestException("That code is not valid. Request a new one.");
+    }
+    await this.prisma.passwordReset.update({ where: { id: row.id }, data: { usedAt: new Date() } });
+    return row;
+  }
+
   private async requireCustomer(req: Request) {
     const actor = customerFrom(req) ?? actorFrom(req);
     if (!actor || actor.kind !== "customer") throw new UnauthorizedException("Sign in to continue.");
@@ -160,6 +272,20 @@ export class CustomersController {
     if (!actor || actor.kind !== "staff") throw new UnauthorizedException("Staff sign-in is required.");
     return actor;
   }
+}
+
+function nationalMobile(raw: string) {
+  const digits = raw.replace(/\D/g, "");
+  if (/^\d{10}$/.test(digits)) return digits;
+  if (/^0\d{10}$/.test(digits)) return digits.slice(1);
+  if (/^91\d{10}$/.test(digits)) return digits.slice(2);
+  return null;
+}
+
+function sameHash(left: string, right: string) {
+  const a = Buffer.from(left);
+  const b = Buffer.from(right);
+  return a.length === b.length && timingSafeEqual(a, b);
 }
 
 export function publicCustomer(customer: { id: string; name: string; email: string; phone: string; blocked: boolean; addresses: unknown }) {

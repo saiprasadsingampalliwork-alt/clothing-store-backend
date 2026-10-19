@@ -3,6 +3,7 @@ import type { Prisma } from "@prisma/client";
 import { PrismaService } from "./prisma.service";
 import { MailService, type MailItem, type MailOrder, type OrderMail } from "./mail.service";
 import { PaymentsService } from "./payments.service";
+import { WhatsAppService } from "./whatsapp.service";
 import { evaluateCoupon, livePrice, shippingFee, type ShippingRules } from "./pricing";
 
 type ItemInput = { slug: string; color: string; size: string; quantity: number };
@@ -47,6 +48,7 @@ export class OrdersService {
   constructor(
     @Inject(PrismaService) private readonly prisma: PrismaService,
     @Inject(MailService) private readonly mail: MailService,
+    @Inject(WhatsAppService) private readonly whatsapp: WhatsAppService,
     @Inject(PaymentsService) private readonly payments: PaymentsService,
   ) {}
 
@@ -163,7 +165,7 @@ export class OrdersService {
       throw error;
     }
 
-    await this.mail.order("confirmed", this.toMail(order));
+    await this.notify("confirmed", order);
     return this.present(order);
   }
 
@@ -184,7 +186,7 @@ export class OrdersService {
         },
       });
     });
-    await this.mail.order("cancelled", this.toMail(updated));
+    await this.notify("cancelled", updated);
     if (updated.payment !== "cod" && updated.razorpayPaymentId) await this.payments.refund(updated.razorpayPaymentId, updated.total * 100);
     return this.present(updated);
   }
@@ -205,7 +207,7 @@ export class OrdersService {
         returnRequest: { ...request, status: request.status ?? "Awaiting review", requestedAt: new Date().toISOString() },
       },
     });
-    await this.mail.order("return-requested", this.toMail(updated));
+    await this.notify("return-requested", updated);
     return this.present(updated);
   }
 
@@ -229,7 +231,7 @@ export class OrdersService {
       });
     });
     const kind = statusMail(updated.status);
-    if (statusChanged && kind) await this.mail.order(kind, this.toMail(updated));
+    if (statusChanged && kind) await this.notify(kind, updated);
     if (statusChanged && updated.status === "Cancelled" && updated.payment !== "cod" && updated.razorpayPaymentId) {
       await this.payments.refund(updated.razorpayPaymentId, updated.total * 100);
     }
@@ -249,7 +251,7 @@ export class OrdersService {
         timeline: [...(order.timeline as { status: string; date: string }[]), { status: "Shipped", date: new Date().toISOString() }],
       },
     });
-    if (!alreadyShipped) await this.mail.order("shipped", this.toMail(updated));
+    if (!alreadyShipped) await this.notify("shipped", updated);
     return this.present(updated);
   }
 
@@ -269,7 +271,7 @@ export class OrdersService {
       });
     });
     const kind: OrderMail = decision === "Rejected" ? "return-declined" : request.resolution === "exchange" ? "return-exchange" : approvedRefund ? "return-approved" : "returned";
-    await this.mail.order(kind, this.toMail(updated));
+    await this.notify(kind, updated);
     if (approvedRefund && order.status !== "Returned" && updated.payment !== "cod" && updated.razorpayPaymentId) {
       await this.payments.refund(updated.razorpayPaymentId, updated.total * 100);
     }
@@ -397,6 +399,12 @@ export class OrdersService {
       throw new BadRequestException(`Cash on delivery is available on orders up to ₹${Number(rules.codMax).toLocaleString("en-IN")}.`);
     }
     return { items, subtotal, discount, shipping, codFee, total, couponCode: coupon?.code };
+  }
+
+  private async notify(kind: OrderMail, order: Parameters<OrdersService["toMail"]>[0] & { phone: string }) {
+    const message = this.toMail(order);
+    await this.mail.order(kind, message);
+    await this.whatsapp.order(kind, { ...message, phone: order.phone });
   }
 
   private toMail(order: {
