@@ -4,6 +4,7 @@ import { createHash } from "crypto";
  * Product and page photos on Cloudinary, for hosts without a lasting disk (Render's free plan).
  * Set CLOUDINARY_URL to the "API environment variable" from the Cloudinary dashboard:
  *   cloudinary://<api_key>:<api_secret>@<cloud_name>
+ * or set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET separately.
  * Without it, photos are saved to the local uploads folder instead.
  */
 type Account = { cloud: string; key: string; secret: string };
@@ -11,7 +12,12 @@ type Account = { cloud: string; key: string; secret: string };
 export function cloudinaryAccount(): Account | null {
   const raw = process.env.CLOUDINARY_URL?.trim();
   const match = raw?.match(/^cloudinary:\/\/([^:]+):([^@]+)@([a-z0-9_-]+)$/i);
-  return match ? { key: match[1], secret: match[2], cloud: match[3] } : null;
+  if (match) return { key: match[1], secret: match[2], cloud: match[3] };
+  // Or the three values as the Cloudinary dashboard lists them.
+  const cloud = process.env.CLOUDINARY_CLOUD_NAME?.trim();
+  const key = process.env.CLOUDINARY_API_KEY?.trim();
+  const secret = process.env.CLOUDINARY_API_SECRET?.trim();
+  return cloud && key && secret ? { cloud, key, secret } : null;
 }
 
 /** Uploads one image and returns its https URL on Cloudinary's image network. */

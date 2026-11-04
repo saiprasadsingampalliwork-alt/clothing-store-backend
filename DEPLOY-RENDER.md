@@ -25,7 +25,8 @@ This is `DATABASE_URL`. Keep it private.
 2. On the dashboard, find **API environment variable**. It looks like
    `cloudinary://123456789012345:abcdEFGH…@your-cloud-name`.
 
-This is `CLOUDINARY_URL`. Keep it private.
+This is `CLOUDINARY_URL`. Keep it private. (Or set the three values the dashboard lists separately:
+`CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET`. A secret on its own is not enough.)
 
 ## 3. API: create the Render service from the blueprint
 
@@ -89,10 +90,12 @@ Each asks for a new password (at least 12 characters) without showing it.
 Free services sleep after 15 minutes without requests and take about a minute to wake.
 
 1. Create a free monitor at [cron-job.org](https://cron-job.org) or [UptimeRobot](https://uptimerobot.com).
-2. URL: `https://<your-service>.onrender.com/v1/health`, every **10 minutes**.
+2. URL: `https://<your-service>.onrender.com/v1/health?db=1`, every **10 minutes**.
 
-`/v1/health` does not touch the database, so the pings use none of Prisma Postgres's free operations. Render's
-free plan includes 750 hours a month, enough for this one service to run all month.
+The free database also sleeps when idle, and the first request to wake it can take several seconds. `?db=1` runs
+one tiny query per ping to keep it awake: about 4,300 database operations a month, well inside the free allowance.
+Use plain `/v1/health` instead if you would rather save those operations and accept a slow first request after a
+quiet spell. Render's free plan includes 750 hours a month, enough for this one service to run all month.
 
 ## 7. Point the storefront at Render
 

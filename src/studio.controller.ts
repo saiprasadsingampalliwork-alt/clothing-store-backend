@@ -1,4 +1,4 @@
-import { BadRequestException, Body, Controller, Delete, Get, Inject, Param, Patch, Post, Put, Req, UnauthorizedException } from "@nestjs/common";
+import { BadRequestException, Body, Controller, Delete, Get, Inject, Param, Patch, Post, Put, Req, UnauthorizedException, Query } from "@nestjs/common";
 import { compare, hash } from "bcryptjs";
 import type { Request } from "express";
 import { actorFrom, customerFrom, signToken, requireOwner } from "./auth";
@@ -17,8 +17,13 @@ export class StudioController {
     @Inject(OrdersService) private readonly orders: OrdersService,
   ) {}
 
+  /**
+   * For uptime pingers. Plain /health never touches the database. /health?db=1 also runs one tiny query,
+   * which keeps a free, sleep-when-idle database awake (one database operation per ping).
+   */
   @Get("health")
-  health() {
+  async health(@Query("db") db?: string) {
+    if (db === "1") await this.prisma.$queryRaw`SELECT 1`;
     return { ok: true, service: "earthen-api" };
   }
 

@@ -1,4 +1,4 @@
-import { BadRequestException, Controller, Get, Inject, NotFoundException, Param, Query, Req } from "@nestjs/common";
+import { BadRequestException, Controller, Get, Inject, NotFoundException, OnModuleInit, Param, Query, Req } from "@nestjs/common";
 import type { Request } from "express";
 import { canonicalState, disabledStates, indianStates, lookupPin } from "./delivery";
 import { OrdersService } from "./orders.service";
@@ -15,8 +15,13 @@ const cache = new Map<string, Reverse>();
 let nextSlot = 0;
 
 @Controller("delivery")
-export class DeliveryController {
+export class DeliveryController implements OnModuleInit {
   constructor(@Inject(OrdersService) private readonly orders: OrdersService) {}
+
+  // Load the PIN directory while the server starts, not during a shopper's first lookup.
+  onModuleInit() {
+    indianStates();
+  }
 
   /** States and union territories, with whether the studio delivers to each. */
   @Get("states")
