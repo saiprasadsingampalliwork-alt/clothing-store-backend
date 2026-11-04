@@ -81,6 +81,19 @@ export class MailService {
     await this.send({ to: order.email, ...message });
   }
 
+  /**
+   * A note for the studio itself: customer WhatsApp replies and WhatsApp connection alerts.
+   * Goes to STUDIO_INBOX_EMAIL; skipped (and logged) when that is not set.
+   */
+  async toStudio(subject: string, text: string) {
+    const to = process.env.STUDIO_INBOX_EMAIL?.trim();
+    if (!to) {
+      console.log(`[mail] STUDIO_INBOX_EMAIL is not set. Skipped studio note “${subject}”.`);
+      return { sent: false, skipped: true };
+    }
+    return this.send({ to, subject, text: [text, "", "Sent by the Earthen studio API."].join("\n") });
+  }
+
   private async send(message: { to: string; subject: string; text: string }) {
     if (!this.configured()) {
       console.log(`[mail] SMTP is not configured. Skipped “${message.subject}” to ${message.to}`);

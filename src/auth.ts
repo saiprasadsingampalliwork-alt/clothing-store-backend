@@ -1,4 +1,5 @@
 import { createHmac, timingSafeEqual } from "crypto";
+import { ForbiddenException, UnauthorizedException } from "@nestjs/common";
 import type { Request } from "express";
 
 export type Actor = { kind: "customer" | "staff"; email: string; role?: string };
@@ -33,4 +34,33 @@ export function customerFrom(req: Request) {
   const header = req.header("x-customer-token");
   if (!header) return null;
   return readToken(header.startsWith("Bearer ") ? header : `Bearer ${header}`);
+}
+
+// Products, categories of products, and their photos belong to the owner and the catalog manager.
+// The role is read from the database so a changed role or removed account takes effect at once.
+export async function requireCatalogStaff(req: Request, prisma: { staff: { findUnique(args: { where: { email: string } }): Promise<{ role: string } | null> } }) {
+  const actor = actorFrom(req);
+  if (!actor || actor.kind !== "staff") throw new UnauthorizedException("Staff sign-in is required.");
+  const member = await prisma.staff.findUnique({ where: { email: actor.email } });
+  if (!member) throw new UnauthorizedException("Staff sign-in is required.");
+  if (member.role !== "Owner" && member.role !== "Catalog manager") throw new ForbiddenException("Only the owner or a catalog manager can change products.");
+  return { ...actor, role: member.role };
+}
+
+export function isStaff(req: Request) {
+  return actorFrom(req)?.kind === "staff";
+}
+
+// Shop structure (audiences) is the owner's to change.
+export async function requireOwner(
+  req: Request,
+  prisma: { staff: { findUnique(args: { where: { email: string } }): Promise<{ role: string } | null> } },
+  what = "make this change",
+) {
+  const actor = actorFrom(req);
+  if (!actor || actor.kind !== "staff") throw new UnauthorizedException("Staff sign-in is required.");
+  const member = await prisma.staff.findUnique({ where: { email: actor.email } });
+  if (!member) throw new UnauthorizedException("Staff sign-in is required.");
+  if (member.role !== "Owner") throw new ForbiddenException(`Only the owner can ${what}.`);
+  return { ...actor, role: member.role };
 }

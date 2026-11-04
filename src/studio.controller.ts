@@ -1,8 +1,10 @@
 import { BadRequestException, Body, Controller, Delete, Get, Inject, Param, Patch, Post, Put, Req, UnauthorizedException } from "@nestjs/common";
 import { compare, hash } from "bcryptjs";
 import type { Request } from "express";
-import { actorFrom, customerFrom, signToken } from "./auth";
+import { actorFrom, customerFrom, signToken, requireOwner } from "./auth";
 import { categorySlug } from "./category-slug";
+import { presentAudience } from "./audiences";
+import { canonicalState } from "./delivery";
 import { presentProduct } from "./catalog.controller";
 import { publicCustomer } from "./customers.controller";
 import { OrdersService } from "./orders.service";
@@ -24,16 +26,21 @@ export class StudioController {
   async bootstrap(@Req() req: Request) {
     const staff = actorFrom(req);
     const customer = customerFrom(req);
-    const [products, coupons, banners, setting, sequence, categories] = await Promise.all([
+    const [products, coupons, banners, setting, sequence, categories, audiences, fabrics, styles] = await Promise.all([
       this.prisma.product.findMany({ orderBy: { name: "asc" } }),
       this.prisma.coupon.findMany({ orderBy: { code: "asc" } }),
       this.prisma.banner.findMany(),
       this.prisma.setting.findUnique({ where: { id: "store" } }),
       this.prisma.sequence.findUnique({ where: { id: "order" } }),
       this.prisma.category.findMany({ orderBy: [{ sort: "asc" }, { label: "asc" }] }),
+      this.prisma.audience.findMany({ orderBy: [{ sort: "asc" }, { label: "asc" }] }),
+      this.prisma.fabric.findMany({ orderBy: { label: "asc" } }),
+      this.prisma.style.findMany({ orderBy: [{ sort: "asc" }, { label: "asc" }] }),
     ]);
-    const presented = products.map(presentProduct);
     const isStaff = staff?.kind === "staff";
+    // Shoppers never receive drafts or archived pieces; staff need them for the admin.
+    const off = new Set(audiences.filter((row) => !row.active).map((row) => row.slug));
+    const presented = products.filter((product) => isStaff || (product.status === "active" && !off.has(product.gender))).map(presentProduct);
     const orders = isStaff
       ? await this.prisma.order.findMany({ orderBy: { createdAt: "desc" } })
       : customer
@@ -60,7 +67,13 @@ export class StudioController {
         blurb: category.blurb,
         image: category.image,
         chart: category.chart === "lower" ? "lower" : "upper",
+        sort: category.sort,
       })),
+      // Shoppers get only switched-on audiences; staff need all of them to prepare products.
+      fabrics,
+      // Switched-off styles stay out of shoppers' filters.
+      styles: styles.filter((row) => isStaff || row.active),
+      audiences: audiences.filter((row) => isStaff || row.active).map(presentAudience),
       bag: me ? { cart: me.cart ?? [], wishlist: me.wishlist ?? [] } : null,
     };
   }
@@ -105,9 +118,17 @@ export class StudioController {
 
   @Put("settings")
   async saveSettings(@Req() req: Request, @Body() body: Record<string, unknown>) {
-    this.requireStaff(req);
+    // Shipping, payments, delivery areas: the owner's to change, as on the admin Settings page.
+    await requireOwner(req, this.prisma, "change store settings");
     const current = await this.orders.settings();
     const next = { ...current, ...body };
+    // Delivery areas: only real state and UT names, written the official way.
+    if (body.disabledStates !== undefined) {
+      const list = Array.isArray(body.disabledStates) ? body.disabledStates : [];
+      const named = list.map(canonicalState);
+      if (named.some((state) => !state)) throw new BadRequestException("Delivery areas must be Indian states or union territories.");
+      next.disabledStates = [...new Set(named as string[])];
+    }
     const saved = await this.prisma.setting.upsert({
       where: { id: "store" },
       create: { id: "store", data: next as object },
@@ -181,7 +202,7 @@ export class StudioController {
     if (!slug || slug === "new" || slug === "all") throw new BadRequestException("Choose another name. New in stays a shop filter.");
     const existing = await this.prisma.category.findUnique({ where: { slug } });
     if (existing) throw new BadRequestException("A category with that name already exists.");
-    const sort = await this.prisma.category.count();
+    const sort = ((await this.prisma.category.aggregate({ _max: { sort: true } }))._max.sort ?? -1) + 1;
     return this.prisma.category.create({
       data: {
         slug,
@@ -192,6 +213,20 @@ export class StudioController {
         sort,
       },
     });
+  }
+
+  // Saves the menu order: the drawer, footer, and shop tabs list categories in this order.
+  @Put("categories/order")
+  async orderCategories(@Req() req: Request, @Body() body: { slugs?: unknown }) {
+    this.requireStaff(req);
+    const slugs = Array.isArray(body.slugs) ? body.slugs.map(String) : [];
+    const existing = await this.prisma.category.findMany({ select: { slug: true } });
+    const known = new Set(existing.map((row) => row.slug));
+    if (slugs.length !== known.size || new Set(slugs).size !== slugs.length || !slugs.every((slug) => known.has(slug))) {
+      throw new BadRequestException("The list changed while you were ordering it. Reload the page and try again.");
+    }
+    await this.prisma.$transaction(slugs.map((slug, sort) => this.prisma.category.update({ where: { slug }, data: { sort } })));
+    return { ok: true };
   }
 
   @Patch("categories/:slug")

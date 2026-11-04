@@ -1,7 +1,10 @@
-import { BadRequestException, Body, Controller, ForbiddenException, Get, Inject, Param, Patch, Post, Query, Req, UnauthorizedException } from "@nestjs/common";
+import { BadRequestException, Body, ConflictException, Controller, Delete, ForbiddenException, Get, Inject, NotFoundException, Param, Patch, Post, Query, Req, UnauthorizedException } from "@nestjs/common";
 import type { Request } from "express";
 import { categorySlug } from "./category-slug";
-import { actorFrom, customerFrom } from "./auth";
+import { audienceMatcher, isOnSale, onSaleWhere, requireSizes, resolveAudience } from "./audiences";
+import { customerFrom, isStaff, requireCatalogStaff } from "./auth";
+import { cleanDetail, resolveFabric, splitFabric } from "./fabrics";
+import { resolveStyles } from "./styles";
 import { MailService } from "./mail.service";
 import { PrismaService } from "./prisma.service";
 
@@ -13,63 +16,80 @@ export class CatalogController {
   ) {}
 
   @Get()
-  async list(@Query("gender") gender?: string | string[]) {
-    const selected = parseGenders(gender);
-    const products = await this.prisma.product.findMany({ orderBy: { name: "asc" } });
-    return products.filter((product) => matchesGender(product.gender, selected)).map(presentProduct);
+  async list(@Req() req: Request, @Query("gender") gender?: string | string[], @Query("style") style?: string | string[]) {
+    const selected = (Array.isArray(gender) ? gender : gender ? [gender] : []).flatMap((item) => item.split(",")).map((item) => item.trim().toLowerCase()).filter(Boolean);
+    // Shoppers only see what is on sale; staff also see drafts and archived pieces.
+    const products = await this.prisma.product.findMany({ where: isStaff(req) ? {} : await onSaleWhere(this.prisma), orderBy: { name: "asc" } });
+    const matches = audienceMatcher(await this.prisma.audience.findMany(), selected);
+    const styles = (Array.isArray(style) ? style : style ? [style] : []).flatMap((item) => item.split(",")).map((item) => item.trim().toLowerCase()).filter(Boolean);
+    return products
+      .filter((product) => matches(product.gender) && (!styles.length || product.styles.some((slug) => styles.includes(slug))))
+      .map(presentProduct);
   }
 
   @Post()
   async create(@Req() req: Request, @Body() body: CreateBody) {
-    this.requireStaff(req);
+    await requireCatalogStaff(req, this.prisma);
     return this.presentSaved(await this.insertProduct(body));
   }
 
   @Post("import")
   async import(@Req() req: Request, @Body() body: { rows?: Record<string, string>[] }) {
-    this.requireStaff(req);
+    await requireCatalogStaff(req, this.prisma);
     const rows = body.rows ?? [];
     let created = 0;
     let updated = 0;
-    for (const row of rows) {
-      const name = (row.name ?? "").trim();
-      if (!name) continue;
-      const slug = slugify(row.slug || name);
-      const existing = await this.prisma.product.findUnique({ where: { slug } });
-      const statusText = (row.status ?? "").trim().toLowerCase();
-      const status = ["active", "draft", "archived"].includes(statusText) ? statusText : undefined;
-      const price = Number(row.price);
-      if (!existing) {
-        await this.insertProduct({
-          name,
-          slug,
-          price: Number.isFinite(price) && price > 0 ? price : 1999,
-          category: row.category,
-          gender: row.gender,
-          fabric: row.fabric,
-          color: row.color,
-          hex: row.hex,
-          silhouette: row.silhouette,
-          status: status ?? "active",
-          stockEach: stockEach(row.stock),
+    // Each row stands alone: a bad row is reported and skipped, the rest still import.
+    const skipped: string[] = [];
+    for (const [index, row] of rows.entries()) {
+      try {
+        const name = (row.name ?? "").trim();
+        if (!name) continue;
+        const slug = slugify(row.slug || name);
+        const existing = await this.prisma.product.findUnique({ where: { slug } });
+        const statusText = (row.status ?? "").trim().toLowerCase();
+        const status = ["active", "draft", "archived"].includes(statusText) ? statusText : undefined;
+        const price = Number(row.price);
+        if (!existing) {
+          await this.insertProduct(
+            {
+            name,
+            slug,
+            price: Number.isFinite(price) && price > 0 ? price : 1999,
+            category: row.category,
+            gender: row.gender,
+            fabric: row.fabric,
+            color: row.color,
+            hex: row.hex,
+            silhouette: row.silhouette,
+            status: status ?? "active",
+            stockEach: stockEach(row.stock),
+            styles: row.styles,
+            },
+            { newFabrics: true },
+          );
+          created += 1;
+          continue;
+        }
+        await this.prisma.product.update({
+          where: { slug },
+          data: {
+            name,
+            price: Number.isFinite(price) && price > 0 ? price : existing.price,
+            category: row.category?.trim() ? await this.ensureCategory(row.category) : existing.category,
+            ...(row.gender?.trim() ? { gender: (await resolveAudience(this.prisma, row.gender)).slug } : {}),
+            ...(row.fabric?.trim() ? await this.fabricFields(row.fabric, undefined, true) : {}),
+            ...(row.styles?.trim() ? { styles: await resolveStyles(this.prisma, row.styles, true) } : {}),
+            status: status ?? existing.status,
+          },
         });
-        created += 1;
-        continue;
+        updated += 1;
+      } catch (error) {
+        const label = (row.name ?? "").trim() || `row ${index + 2}`;
+        skipped.push(`${label} (row ${index + 2}): ${error instanceof Error ? error.message : "could not be saved"}`);
       }
-      await this.prisma.product.update({
-        where: { slug },
-        data: {
-          name,
-          price: Number.isFinite(price) && price > 0 ? price : existing.price,
-          category: row.category?.trim() ? await this.ensureCategory(row.category) : existing.category,
-          ...(row.gender?.trim() ? { gender: genderOf(row.gender, row.silhouette || existing.silhouette) } : {}),
-          fabric: row.fabric?.trim() || existing.fabric,
-          status: status ?? existing.status,
-        },
-      });
-      updated += 1;
     }
-    return { created, updated };
+    return { created, updated, skipped };
   }
 
   @Get(":slug/review")
@@ -133,48 +153,89 @@ export class CatalogController {
   }
 
   @Get(":slug")
-  async one(@Param("slug") slug: string) {
+  async one(@Req() req: Request, @Param("slug") slug: string) {
     const product = await this.prisma.product.findUnique({ where: { slug } });
-    if (!product) throw new BadRequestException("Product not found.");
+    if (!product || (!isStaff(req) && !(await isOnSale(this.prisma, product)))) throw new NotFoundException("Product not found.");
     return presentProduct(product);
   }
 
   @Patch(":slug")
   async update(@Req() req: Request, @Param("slug") slug: string, @Body() body: Record<string, unknown>) {
-    const actor = actorFrom(req);
-    if (!actor || actor.kind !== "staff") throw new UnauthorizedException("Staff sign-in is required.");
+    await requireCatalogStaff(req, this.prisma);
     const product = await this.prisma.product.findUnique({ where: { slug } });
     if (!product) throw new BadRequestException("Product not found.");
-    const nextStock = (body.stock as Record<string, number> | undefined) ?? (product.stock as Record<string, number>);
-    const updated = await this.prisma.product.update({
-      where: { slug },
-      data: {
-        price: numberOr(body.price, product.price),
-        salePrice: body.salePrice === null || body.salePrice === "" ? null : numberOr(body.salePrice, product.salePrice),
-        saleStart: stringOr(body.saleStart, product.saleStart),
-        saleEnd: stringOr(body.saleEnd, product.saleEnd),
-        status: stringOr(body.status, product.status),
-        ...(typeof body.gender === "string" && body.gender.trim() ? { gender: genderOf(body.gender, product.silhouette) } : {}),
+    const nextStock = body.stock === undefined ? undefined : cleanStock(body.stock);
+    const stockBase = body.stock !== undefined && body.stockBase !== undefined ? cleanStock(body.stockBase) : undefined;
+    const price = body.price === undefined ? product.price : Number(body.price);
+    if (!Number.isFinite(price) || price <= 0) throw new BadRequestException("Enter a price above zero in rupees.");
+    const salePrice = body.salePrice === undefined ? product.salePrice : body.salePrice === null || body.salePrice === "" ? null : Number(body.salePrice);
+    if (salePrice !== null && (!Number.isFinite(salePrice) || salePrice <= 0 || Math.round(salePrice) >= Math.round(price))) {
+      throw new BadRequestException("A sale price must be above zero and below the regular price.");
+    }
+    const saleStart = stringOr(body.saleStart, product.saleStart);
+    const saleEnd = stringOr(body.saleEnd, product.saleEnd);
+    if ([saleStart, saleEnd].some((day) => day && !/^\d{4}-\d{2}-\d{2}$/.test(day))) throw new BadRequestException("Sale dates must be real dates.");
+    if (saleStart && saleEnd && saleEnd < saleStart) throw new BadRequestException("The sale cannot end before it starts.");
+    const status = body.status === undefined ? product.status : String(body.status);
+    if (!["active", "draft", "archived"].includes(status)) throw new BadRequestException("Status must be active, draft, or archived.");
+    const data = {
+        price: Math.round(price),
+        salePrice: salePrice === null ? null : Math.round(salePrice),
+        saleStart,
+        saleEnd,
+        status,
+        ...(typeof body.gender === "string" && body.gender.trim() ? { gender: (await resolveAudience(this.prisma, body.gender)).slug } : {}),
+        ...(body.sizes !== undefined ? { sizes: requireSizes(body.sizes) } : {}),
+        ...(typeof body.isNew === "boolean" ? { isNew: body.isNew } : {}),
+        ...(body.styles !== undefined ? { styles: await resolveStyles(this.prisma, body.styles) } : {}),
         ...(typeof body.category === "string" && body.category.trim() ? { category: await this.ensureCategory(body.category) } : {}),
         metaTitle: stringOr(body.metaTitle, product.metaTitle),
         metaDescription: stringOr(body.metaDescription, product.metaDescription),
-        stock: nextStock,
         ...(typeof body.name === "string" && body.name.trim() ? { name: body.name.trim().replace(/\s+/g, " ").slice(0, 80) } : {}),
         ...(typeof body.description === "string" ? { description: body.description.trim().slice(0, 800) } : {}),
-        ...(typeof body.fabric === "string" && body.fabric.trim() ? { fabric: body.fabric.trim().replace(/\s+/g, " ").slice(0, 160) } : {}),
+        ...(typeof body.fabric === "string" && body.fabric.trim() ? await this.fabricFields(body.fabric, body.fabricDetail) : {}),
+        ...(typeof body.fabric !== "string" && typeof body.fabricDetail === "string" ? { fabricDetail: cleanDetail(body.fabricDetail) } : {}),
         ...(Array.isArray(body.care) ? { care: cleanLines(body.care) } : {}),
         ...(cleanColors(body.colors).length ? { colors: cleanColors(body.colors) } : {}),
         ...(Array.isArray(body.photos) ? { photos: cleanPhotos(body.photos) } : {}),
-      },
+    };
+    // Stock is written only when the editor changed it, with the row locked, so an order placed meanwhile is never undone.
+    const updated = await this.prisma.$transaction(async (tx) => {
+      if (!nextStock) return tx.product.update({ where: { slug }, data });
+      await tx.$queryRaw`SELECT slug FROM "Product" WHERE slug = ${slug} FOR UPDATE`;
+      const current = await tx.product.findUnique({ where: { slug }, select: { stock: true } });
+      // The editor sends the stock it started from; if orders or returns moved it since, saving would undo them.
+      if (stockBase && !sameStock(stockBase, (current?.stock ?? {}) as Record<string, number>)) {
+        throw new ConflictException("Stock changed while you were editing, most likely from a new order. Reload the page to see the latest numbers, then make your change again.");
+      }
+      return tx.product.update({ where: { slug }, data: { ...data, stock: nextStock } });
     });
-    await this.sendRestockMail(product.name, slug, nextStock);
+    await this.sendRestockMail(product.name, slug, updated.stock as Record<string, number>);
     return this.presentSaved(updated);
+  }
+
+  @Delete(":slug")
+  async remove(@Req() req: Request, @Param("slug") slug: string) {
+    await requireCatalogStaff(req, this.prisma);
+    const product = await this.prisma.product.findUnique({ where: { slug } });
+    if (!product) throw new BadRequestException("Product not found.");
+    const orders = await this.prisma.order.findMany();
+    const hasOrder = orders.some((order) => {
+      const items = order.items as Array<{ slug?: string }>;
+      return Array.isArray(items) && items.some((item) => item.slug === slug);
+    });
+    if (hasOrder) {
+      throw new BadRequestException("This product has existing customer orders and cannot be deleted. Change its status to Archived instead.");
+    }
+    await this.prisma.restockAlert.deleteMany({ where: { slug } });
+    await this.prisma.product.delete({ where: { slug } });
+    return { ok: true };
   }
 
   @Post(":slug/restock")
   async restock(@Param("slug") slug: string, @Body() body: { color?: string; size?: string; contact?: string }) {
     const product = await this.prisma.product.findUnique({ where: { slug } });
-    if (!product || product.status !== "active") throw new BadRequestException("This piece is not in the shop.");
+    if (!product || !(await isOnSale(this.prisma, product))) throw new BadRequestException("This piece is not in the shop.");
     const color = (body.color ?? "").trim();
     const size = (body.size ?? "").trim();
     const contact = (body.contact ?? "").trim();
@@ -201,11 +262,6 @@ export class CatalogController {
       const result = await this.mail.restockBack(alert.contact, name, alert.color, alert.size, `${this.mail.appUrl()}/product/${slug}`);
       if (result.sent) await this.prisma.restockAlert.update({ where: { id: alert.id }, data: { emailedAt: new Date() } });
     }
-  }
-
-  private requireStaff(req: Request) {
-    const actor = actorFrom(req);
-    if (!actor || actor.kind !== "staff") throw new UnauthorizedException("Staff sign-in is required.");
   }
 
   private async requireCustomer(req: Request) {
@@ -246,7 +302,7 @@ export class CatalogController {
       .map((word) => word[0].toUpperCase() + word.slice(1))
       .join(" ");
     const label = raw.toLowerCase() === slug || raw.toLowerCase().replace(/-/g, " ") === slug.replace(/-/g, " ") ? titled : raw.replace(/\s+/g, " ");
-    const sort = await this.prisma.category.count();
+    const sort = ((await this.prisma.category.aggregate({ _max: { sort: true } }))._max.sort ?? -1) + 1;
     await this.prisma.category.create({
       data: { slug, label, chart: slug === "bottoms" ? "lower" : "upper", sort },
     });
@@ -258,35 +314,58 @@ export class CatalogController {
     return { ...presentProduct(product), category };
   }
 
-  private async insertProduct(body: CreateBody) {
+  /** The fabric must be in the list (CSV import may add it). Without a separate detail, "Linen, 160 gsm" is split. */
+  private async fabricFields(fabric: string, detail: unknown, newFabrics = false) {
+    const parts = typeof detail === "string" ? { fabric, detail } : splitFabric(fabric);
+    return { fabric: await resolveFabric(this.prisma, parts.fabric, newFabrics), fabricDetail: cleanDetail(parts.detail) };
+  }
+
+  private async insertProduct(body: CreateBody, options: { newFabrics?: boolean } = {}) {
     const name = body.name?.trim();
     if (!name) throw new BadRequestException("A product needs a name.");
     const slug = await this.uniqueSlug(slugify(body.slug || name));
-    const colors = (body.colors?.length ? body.colors : [{ name: body.color?.trim() || "Sand", hex: body.hex?.trim() || "#E4D7C4" }]).filter((color) => color.name);
+    const colors = cleanColors(body.colors?.length ? body.colors : [{ name: body.color?.trim() || "Sand", hex: body.hex?.trim() || "#E4D7C4" }]);
     if (!colors.length) throw new BadRequestException("Add at least one colour.");
-    const sizes = ["XS", "S", "M", "L", "XL"];
-    const each = body.stockEach && body.stockEach > 0 ? Math.min(body.stockEach, 99) : 12;
+    const price = body.price === undefined || body.price === null ? 1999 : Number(body.price);
+    if (!Number.isFinite(price) || price <= 0) throw new BadRequestException("Enter a price above zero in rupees.");
+    // Refuse a bad audience, sizes, or fabric before anything (like a new category) is created.
+    if (body.gender?.trim()) await resolveAudience(this.prisma, body.gender);
+    if (body.sizes !== undefined) requireSizes(body.sizes);
+    // Without a choice, a new product starts as Casual when that style exists.
+    const styles =
+      body.styles !== undefined && String(body.styles).trim() !== ""
+        ? await resolveStyles(this.prisma, body.styles, options.newFabrics)
+        : (await this.prisma.style.findUnique({ where: { slug: "casual" } }))
+          ? ["casual"]
+          : [];
+    const fabric = body.fabric?.trim()
+      ? await this.fabricFields(body.fabric, body.fabricDetail, options.newFabrics)
+      : { fabric: await resolveFabric(this.prisma, "Cotton", true), fabricDetail: "" };
+    const category = await this.ensureCategory(body.category);
+    const silhouette = silhouetteOf(body.silhouette, category);
+    const audience = await resolveAudience(this.prisma, body.gender, silhouette);
+    // A new product takes its audience's sizes unless it brings its own.
+    const sizes = body.sizes !== undefined ? requireSizes(body.sizes) : requireSizes(audience.sizes);
+    const each = typeof body.stockEach === "number" && Number.isFinite(body.stockEach) && body.stockEach > 0 ? Math.min(Math.round(body.stockEach), 9999) : 0;
     const stock: Record<string, number> = {};
     for (const color of colors) {
       for (const size of sizes) stock[`${color.name}|${size}`] = each;
     }
-    const category = await this.ensureCategory(body.category);
-    const silhouette = silhouetteOf(body.silhouette, category);
-    const price = Number(body.price);
     return this.prisma.product.create({
       data: {
+        ...fabric,
         slug,
         name,
-        price: Number.isFinite(price) && price > 0 ? Math.round(price) : 1999,
+        price: Math.round(price),
         category,
-        gender: genderOf(body.gender, silhouette),
-        fabric: body.fabric?.trim() || "Cotton",
+        gender: audience.slug,
+        styles,
         description: body.description?.trim() || `${name}. Cut and sewn in Bengaluru.`,
         details: ["Cut in Bengaluru"],
         care: ["Machine wash cold", "Hang dry in the shade"],
         rating: 0,
         reviewCount: 0,
-        isNew: true,
+        isNew: body.isNew ?? true,
         reviews: [],
         colors,
         sizes,
@@ -295,7 +374,8 @@ export class CatalogController {
         silhouette,
         origin: "Cut and sewn in Bengaluru",
         fit: "Fits true to size.",
-        model: { heightCm: 178, size: "M" },
+        // Only adult pieces get the studio model line; it would be wrong for children's sizes.
+        model: audience.group === "adults" ? { heightCm: 178, size: sizes.includes("M") ? "M" : sizes[0] } : { heightCm: 0, size: "" },
       },
     });
   }
@@ -311,14 +391,6 @@ export class CatalogController {
   }
 }
 
-function numberOr(value: unknown, fallback: number): number;
-function numberOr(value: unknown, fallback: number | null): number | null;
-function numberOr(value: unknown, fallback: number | null) {
-  if (value === undefined || value === null || value === "") return fallback;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : fallback;
-}
-
 function stringOr(value: unknown, fallback: string) {
   return typeof value === "string" ? value : fallback;
 }
@@ -330,6 +402,7 @@ type CreateBody = {
   category?: string;
   gender?: string;
   fabric?: string;
+  fabricDetail?: string;
   description?: string;
   color?: string;
   hex?: string;
@@ -337,6 +410,9 @@ type CreateBody = {
   silhouette?: string;
   status?: string;
   stockEach?: number;
+  sizes?: unknown;
+  isNew?: boolean;
+  styles?: unknown;
 };
 
 function slugify(value: string) {
@@ -347,40 +423,28 @@ function slugify(value: string) {
   return slug || "piece";
 }
 
-function genderOf(value: string | undefined, silhouette?: string) {
-  const text = (value ?? "").trim().toLowerCase();
-  if (text === "women" || text === "woman") return "women";
-  if (text === "men" || text === "man") return "men";
-  if (text === "unisex") return "unisex";
-  if (silhouette === "skirt") return "women";
-  return "unisex";
-}
-
-function parseGenders(value?: string | string[]) {
-  const raw = Array.isArray(value) ? value : value ? [value] : [];
-  return raw
-    .flatMap((item) => item.split(","))
-    .map((item) => item.trim().toLowerCase())
-    .filter((item) => item === "women" || item === "men" || item === "unisex");
-}
-
-function matchesGender(gender: string, selected: string[]) {
-  if (!selected.length) return true;
-  const chosen = new Set(selected);
-  return (
-    (chosen.has("women") && (gender === "women" || gender === "unisex")) ||
-    (chosen.has("men") && (gender === "men" || gender === "unisex")) ||
-    (chosen.has("unisex") && gender === "unisex")
-  );
-}
-
-
 function silhouetteOf(value: string | undefined, category: string) {
   const allowed = ["overshirt", "tee", "shirt", "trouser", "skirt", "cardigan", "jacket"];
   if (value && allowed.includes(value)) return value;
   if (category === "bottoms") return "trouser";
   if (category === "outerwear") return "jacket";
   return "tee";
+}
+
+function sameStock(left: Record<string, number>, right: Record<string, number>) {
+  const keys = new Set([...Object.keys(left), ...Object.keys(right)]);
+  return [...keys].every((key) => (left[key] ?? 0) === (right[key] ?? 0));
+}
+
+function cleanStock(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new BadRequestException("Stock must list units for each colour and size.");
+  const stock: Record<string, number> = {};
+  for (const [key, units] of Object.entries(value as Record<string, unknown>)) {
+    const count = Number(units);
+    if (!key.includes("|") || !Number.isInteger(count) || count < 0) throw new BadRequestException("Stock must be whole numbers, zero or more.");
+    stock[key] = Math.min(count, 9999);
+  }
+  return stock;
 }
 
 function cleanLines(value: unknown) {
@@ -428,7 +492,7 @@ function cleanPhotos(value: unknown) {
 
 function stockEach(value?: string) {
   const parsed = Number(value);
-  if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 99) return undefined;
+  if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 9999) return undefined;
   return Math.round(parsed);
 }
 
@@ -439,6 +503,8 @@ export function presentProduct(product: {
   category: string;
   gender?: string;
   fabric: string;
+  fabricDetail?: string;
+  styles?: string[];
   description: string;
   details: unknown;
   care: unknown;
@@ -467,8 +533,10 @@ export function presentProduct(product: {
       name: product.name,
       price: product.price,
       category: product.category,
-      gender: genderOf(product.gender, product.silhouette),
+      gender: product.gender || "unisex",
       fabric: product.fabric,
+      fabricDetail: product.fabricDetail ?? "",
+      styles: product.styles ?? [],
       description: product.description,
       details: product.details,
       care: product.care,

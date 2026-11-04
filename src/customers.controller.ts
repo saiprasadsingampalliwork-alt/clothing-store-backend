@@ -6,9 +6,24 @@ import { actorFrom, customerFrom, signToken } from "./auth";
 import { hashToken, MailService } from "./mail.service";
 import { PrismaService } from "./prisma.service";
 import { cartKey, wishlistKey } from "./nudges.service";
+import { cleanAddress } from "./delivery";
+import { RateLimit } from "./rate-limit";
 import { WhatsAppService } from "./whatsapp.service";
 
 const CODE_MINUTES = 10;
+
+// Each code costs a WhatsApp message and gives a guesser five more tries, so requests are limited per mobile and per visitor.
+const codesPerMobile = new RateLimit(3, 15 * 60 * 1000, "Too many codes for this mobile. Wait 15 minutes, then ask again.");
+const codesPerVisitor = new RateLimit(10, 10 * 60 * 1000, "Too many code requests. Wait a few minutes and try again.");
+const guessesPerVisitor = new RateLimit(20, 10 * 60 * 1000, "Too many tries. Wait a few minutes and try again.");
+
+/**
+ * Only when MESSAGES_DEMO=true, and only while email or WhatsApp is not set up, a sign-in code or reset link
+ * is shown on screen instead of being sent. Off by default: showing it would let anyone take over any account.
+ */
+function messagesDemo() {
+  return process.env.MESSAGES_DEMO?.trim().toLowerCase() === "true";
+}
 const CODE_ATTEMPTS = 5;
 
 @Controller("customers")
@@ -20,7 +35,7 @@ export class CustomersController {
   ) {}
 
   @Post("register")
-  async register(@Body() body: { name: string; email: string; phone: string; password: string }) {
+  async register(@Body() body: { name: string; email: string; phone: string; password: string; whatsappOptIn?: boolean }) {
     const email = body.email.trim().toLowerCase();
     const existing = await this.prisma.customer.findUnique({ where: { email } });
     if (existing) throw new BadRequestException("An account with that email already exists.");
@@ -31,6 +46,9 @@ export class CustomersController {
         phone: body.phone,
         passwordHash: await hash(body.password, 10),
         addresses: [],
+        // Reminders are marketing messages, so they need the customer's own tick.
+        whatsappOptIn: body.whatsappOptIn === true,
+        whatsappOptInAt: body.whatsappOptIn === true ? new Date() : null,
       },
     });
     return { token: signToken({ kind: "customer", email }), user: publicCustomer(customer) };
@@ -48,22 +66,25 @@ export class CustomersController {
   }
 
   @Post("login-code")
-  async loginCode(@Body() body: { phone?: string }) {
+  async loginCode(@Req() req: Request, @Body() body: { phone?: string }) {
     const phone = nationalMobile(body.phone || "");
     if (!phone) throw new BadRequestException("Enter a 10-digit mobile number.");
+    this.requireCodeDelivery("Sign-in by WhatsApp code is not available yet. Sign in with your email and password.");
+    codesPerVisitor.take(req.ip || "unknown");
+    codesPerMobile.take(`login:${phone}`);
+    // The same answer whether or not the mobile has an account, so mobiles cannot be checked one by one.
     const matches = await this.prisma.customer.findMany({ where: { phone } });
-    if (matches.length > 1) throw new BadRequestException("That mobile is on more than one account. Sign in with email.");
-    if (matches.length === 0) throw new BadRequestException("No account uses that mobile.");
-    const customer = matches[0];
-    if (customer.blocked) throw new BadRequestException("This account is blocked. Write to the studio if this is a mistake.");
+    const customer = matches.length === 1 && !matches[0].blocked ? matches[0] : null;
+    if (!customer) return { ok: true };
     await this.prisma.passwordReset.deleteMany({ where: { email: customer.email, purpose: "login", usedAt: null } });
     const code = await this.saveCode(customer.email, "login");
     const result = await this.whatsapp.signInCode(phone, code);
-    return { ok: true, previewCode: result.skipped ? code : undefined };
+    return { ok: true, previewCode: result.skipped && messagesDemo() ? code : undefined };
   }
 
   @Post("login-code/verify")
-  async loginWithCode(@Body() body: { phone?: string; code?: string }) {
+  async loginWithCode(@Req() req: Request, @Body() body: { phone?: string; code?: string }) {
+    guessesPerVisitor.take(req.ip || "unknown");
     const phone = nationalMobile(body.phone || "");
     if (!phone) throw new BadRequestException("That code is not valid. Request a new one.");
     const matches = await this.prisma.customer.findMany({ where: { phone } });
@@ -75,22 +96,29 @@ export class CustomersController {
   }
 
   @Post("forgot-password")
-  async forgot(@Body() body: { email?: string; phone?: string }) {
+  async forgot(@Req() req: Request, @Body() body: { email?: string; phone?: string }) {
+    codesPerVisitor.take(req.ip || "unknown");
     if (body.phone?.trim()) return this.forgotByPhone(body.phone);
     const email = body.email?.trim().toLowerCase();
     if (!email) return { ok: true };
+    codesPerMobile.take(`reset-email:${email}`);
     const customer = await this.prisma.customer.findUnique({ where: { email } });
     if (!customer) return { ok: true };
+    if (!this.mail.configured() && !messagesDemo()) {
+      console.warn(`[mail] A password reset was asked for ${email}, but email is not set up, so no link was sent.`);
+      return { ok: true };
+    }
     const reset = this.mail.newResetToken();
     await this.prisma.passwordReset.deleteMany({ where: { email, purpose: "reset", usedAt: null } });
     await this.prisma.passwordReset.create({ data: { email, tokenHash: reset.tokenHash, expiresAt: reset.expiresAt } });
     const url = `${this.mail.appUrl()}/reset-password?token=${reset.token}`;
     const result = await this.mail.passwordReset(email, url);
-    return { ok: true, previewUrl: result.skipped ? url : undefined };
+    return { ok: true, previewUrl: result.skipped && messagesDemo() ? url : undefined };
   }
 
   @Post("reset-password")
-  async reset(@Body() body: { token?: string; phone?: string; code?: string; password: string }) {
+  async reset(@Req() req: Request, @Body() body: { token?: string; phone?: string; code?: string; password: string }) {
+    guessesPerVisitor.take(req.ip || "unknown");
     if (!body.password || body.password.length < 8) throw new BadRequestException("Use at least 8 characters.");
     if (body.phone?.trim()) return this.resetWithCode(body.phone, body.code, body.password);
     const token = body.token?.trim();
@@ -113,19 +141,31 @@ export class CustomersController {
   }
 
   @Patch("me")
-  async updateMe(@Req() req: Request, @Body() body: { name?: string; phone?: string }) {
+  async updateMe(@Req() req: Request, @Body() body: { name?: string; phone?: string; whatsappOptIn?: boolean }) {
     const customer = await this.requireCustomer(req);
+    const optIn = typeof body.whatsappOptIn === "boolean" ? body.whatsappOptIn : customer.whatsappOptIn;
     const updated = await this.prisma.customer.update({
       where: { id: customer.id },
-      data: { name: body.name ?? customer.name, phone: body.phone ?? customer.phone },
+      data: {
+        name: body.name ?? customer.name,
+        phone: body.phone ?? customer.phone,
+        whatsappOptIn: optIn,
+        whatsappOptInAt: optIn ? (customer.whatsappOptIn ? customer.whatsappOptInAt : new Date()) : null,
+      },
     });
     return publicCustomer(updated);
   }
 
   @Post("me/addresses")
-  async saveAddress(@Req() req: Request, @Body() address: { id: string; isDefault?: boolean }) {
+  async saveAddress(@Req() req: Request, @Body() body: { id: string; isDefault?: boolean; state?: unknown; pin?: unknown }) {
     const customer = await this.requireCustomer(req);
+    // Saved addresses are cleaned and checked like checkout ones, except that a state the studio
+    // does not deliver to yet can still be saved.
+    const address = { ...cleanAddress(body), id: String(body.id ?? "").slice(0, 60) || `addr-${Date.now()}` };
     const current = (customer.addresses as { id: string; isDefault?: boolean }[]) ?? [];
+    if (!current.some((entry) => entry.id === address.id) && current.length >= 20) {
+      throw new BadRequestException("The address book holds 20 addresses. Remove one to add another.");
+    }
     const next = current.some((entry) => entry.id === address.id)
       ? current.map((entry) => (entry.id === address.id ? address : entry))
       : [...current, address];
@@ -202,14 +242,20 @@ export class CustomersController {
   private async forgotByPhone(raw: string) {
     const phone = nationalMobile(raw);
     if (!phone) throw new BadRequestException("Enter a 10-digit mobile number.");
+    this.requireCodeDelivery("Resetting by WhatsApp code is not available yet. Use the email link instead.");
+    codesPerMobile.take(`reset:${phone}`);
     const matches = await this.prisma.customer.findMany({ where: { phone } });
-    if (matches.length > 1) throw new BadRequestException("That mobile is on more than one account. Use the email link.");
-    if (matches.length === 0) return { ok: true };
+    if (matches.length !== 1) return { ok: true };
     const customer = matches[0];
     await this.prisma.passwordReset.deleteMany({ where: { email: customer.email, purpose: "reset", usedAt: null } });
     const code = await this.saveCode(customer.email, "reset");
     const result = await this.whatsapp.passwordCode(phone, code);
-    return { ok: true, previewCode: result.skipped ? code : undefined };
+    return { ok: true, previewCode: result.skipped && messagesDemo() ? code : undefined };
+  }
+
+  /** Codes go out by WhatsApp; without it they can only be shown on screen in demo mode. */
+  private requireCodeDelivery(message: string) {
+    if (!this.whatsapp.configured() && !messagesDemo()) throw new BadRequestException(message);
   }
 
   private async saveCode(email: string, purpose: "reset" | "login") {
@@ -289,8 +335,9 @@ function sameHash(left: string, right: string) {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
-export function publicCustomer(customer: { id: string; name: string; email: string; phone: string; blocked: boolean; addresses: unknown }) {
+export function publicCustomer(customer: { id: string; name: string; email: string; phone: string; blocked: boolean; addresses: unknown; whatsappOptIn?: boolean }) {
   return {
+    whatsappOptIn: customer.whatsappOptIn ?? false,
     id: customer.id,
     name: customer.name,
     email: customer.email,

@@ -1,4 +1,5 @@
 import { Inject, Injectable, OnModuleDestroy, OnModuleInit } from "@nestjs/common";
+import { onSaleWhere } from "./audiences";
 import { livePrice } from "./pricing";
 import { PrismaService } from "./prisma.service";
 import { WhatsAppService, type WhatsAppOrder } from "./whatsapp.service";
@@ -80,6 +81,8 @@ export class NudgesService implements OnModuleInit, OnModuleDestroy {
       const customers = await this.prisma.customer.findMany({
         where: {
           blocked: false,
+          // Reminders are marketing: only customers who said yes, and who have not since sent STOP.
+          whatsappOptIn: true,
           OR: [{ cartUpdatedAt: { lte: cutoff } }, { wishlistUpdatedAt: { lte: cutoff } }],
         },
       });
@@ -110,7 +113,8 @@ export class NudgesService implements OnModuleInit, OnModuleDestroy {
           if (slug) slugs.add(slug);
         }
       }
-      const products = await this.prisma.product.findMany({ where: { slug: { in: [...slugs] } } });
+      // Only pieces a shopper can buy right now: not drafts, archived, or for a switched-off audience.
+      const products = await this.prisma.product.findMany({ where: { slug: { in: [...slugs] }, ...(await onSaleWhere(this.prisma)) } });
       const bySlug = new Map(products.map((product) => [product.slug, product]));
       const settings = await this.prisma.setting.findUnique({ where: { id: "store" } });
       const sale = (settings?.data ?? {}) as { saleEnabled?: boolean; salePercent?: number; saleStart?: string; saleEnd?: string };
@@ -159,7 +163,9 @@ export class NudgesService implements OnModuleInit, OnModuleDestroy {
     key: string,
     send: () => Promise<{ sent: boolean; skipped: boolean }>,
   ) {
-    await this.prisma.customer.update({ where: { id }, data: { [field]: key } });
+    // Claim the reminder first, so a second API server (or an overlapping run) cannot send it again.
+    const claimed = await this.prisma.customer.updateMany({ where: { id, NOT: { [field]: key } }, data: { [field]: key } });
+    if (claimed.count === 0) return;
     const result = await send();
     if (!result.sent && !result.skipped) {
       await this.prisma.customer.update({ where: { id }, data: { [field]: "" } });
@@ -182,9 +188,10 @@ function pricedCart(
     const quantity = Math.max(0, Math.round(Number(line.quantity) || 0));
     if (!line.slug || quantity < 1) continue;
     const product = bySlug.get(line.slug);
-    const name = product?.name || line.name || "";
+    if (!product) continue;
+    const name = product.name || line.name || "";
     if (!name.trim()) continue;
-    const price = product ? livePrice(product, sale) : Math.max(0, Math.round(Number(line.price) || 0));
+    const price = livePrice(product, sale);
     items.push({
       name,
       color: line.color || "",

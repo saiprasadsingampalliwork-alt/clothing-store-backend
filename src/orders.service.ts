@@ -1,10 +1,13 @@
-import { BadRequestException, Inject, Injectable, NotFoundException } from "@nestjs/common";
+import { randomBytes } from "crypto";
+import { BadRequestException, Inject, Injectable, NotFoundException, OnModuleInit } from "@nestjs/common";
 import type { Prisma } from "@prisma/client";
 import { PrismaService } from "./prisma.service";
 import { MailService, type MailItem, type MailOrder, type OrderMail } from "./mail.service";
-import { PaymentsService } from "./payments.service";
+import { PaymentNotConfirmedException, PaymentsService } from "./payments.service";
 import { WhatsAppService } from "./whatsapp.service";
 import { evaluateCoupon, livePrice, shippingFee, type CouponRecord, type ShippingRules } from "./pricing";
+import { isOnSale } from "./audiences";
+import { checkDeliveryAddress, cleanMobile } from "./delivery";
 
 type ItemInput = { slug: string; color: string; size: string; quantity: number };
 
@@ -43,14 +46,35 @@ const defaultSettings: ShippingRules & Record<string, unknown> = {
   saleEnd: "",
 };
 
+/** Where an order may go next. Cancelled and Returned are final; returns go through decideReturn. */
+export const NEXT_STATUS: Record<string, string[]> = {
+  Confirmed: ["Packed", "Shipped", "Cancelled"],
+  Packed: ["Shipped", "Cancelled"],
+  Shipped: ["Out for delivery", "Delivered"],
+  "Out for delivery": ["Delivered"],
+  Delivered: [],
+  "Return requested": [],
+  Cancelled: [],
+  Returned: [],
+};
+
+type PaymentStatus = "cod" | "paid" | "demo" | "free";
+type Prepared = PlaceInput & { existingOrderId?: string; paymentStatus: PaymentStatus; amountPaise?: number };
+
 @Injectable()
-export class OrdersService {
+export class OrdersService implements OnModuleInit {
   constructor(
     @Inject(PrismaService) private readonly prisma: PrismaService,
     @Inject(MailService) private readonly mail: MailService,
     @Inject(WhatsAppService) private readonly whatsapp: WhatsAppService,
     @Inject(PaymentsService) private readonly payments: PaymentsService,
   ) {}
+
+  // Gives older orders an access key and a payment status, once.
+  async onModuleInit() {
+    await this.prisma.$executeRaw`UPDATE "Order" SET "accessKey" = md5(random()::text || id) WHERE "accessKey" = ''`;
+    await this.prisma.$executeRaw`UPDATE "Order" SET "paymentStatus" = CASE WHEN payment = 'cod' THEN 'cod' WHEN "razorpayPaymentId" IS NOT NULL THEN 'paid' ELSE 'demo' END WHERE "paymentStatus" = ''`;
+  }
 
   async settings(): Promise<ShippingRules & Record<string, unknown>> {
     const row = await this.prisma.setting.findUnique({ where: { id: "store" } });
@@ -64,12 +88,13 @@ export class OrdersService {
       const customer = await this.prisma.customer.findUnique({ where: { email } });
       if (customer?.blocked) throw new BadRequestException("This account is blocked and cannot place an order.");
     }
+    this.requireOnlinePayments();
     const quoted = await this.quote({ ...input, email: email || input.email });
-    if (!this.payments.configured()) {
-      console.log("[pay] Razorpay is not configured. Online checkout will be recorded without a charge.");
-      return { configured: false as const };
-    }
-    if (quoted.total < 1) throw new BadRequestException("This order does not need a payment.");
+    // Demo mode records the order without a charge; a ₹0 order has nothing to charge.
+    if (this.payments.mode() === "demo") return { configured: false as const, mode: "demo" as const };
+    if (quoted.total < 1) return { configured: false as const, mode: "live" as const };
+    // Checkouts that were started but never paid are cleared after a day.
+    await this.prisma.paymentCheckout.deleteMany({ where: { usedAt: null, failedReason: null, createdAt: { lt: new Date(Date.now() - 86400000) } } });
     const gateway = await this.payments.createOrder(quoted.total * 100, `earthen-${Date.now()}`);
     await this.prisma.paymentCheckout.create({
       data: {
@@ -87,10 +112,23 @@ export class OrdersService {
     };
   }
 
+  /** Called by the payment.captured webhook. Creates the order if the browser did not, or refunds if it cannot. */
   async capturePayment(razorpayOrderId: string, paymentId: string) {
     const checkout = await this.prisma.paymentCheckout.findUnique({ where: { razorpayOrderId } });
-    if (!checkout || checkout.usedAt) return null;
-    return this.place({ ...(checkout.payload as PlaceInput), razorpay: { orderId: razorpayOrderId, paymentId } }, { trustedPayment: true });
+    if (!checkout || checkout.usedAt || checkout.failedReason) return null;
+    try {
+      return await this.place({ ...(checkout.payload as PlaceInput), razorpay: { orderId: razorpayOrderId, paymentId } }, { trustedPayment: true });
+    } catch (error) {
+      console.error(`[pay] Captured payment ${paymentId} did not become an order.`, error);
+      return null;
+    }
+  }
+
+  /** Records a Razorpay refund webhook on the order or the failed checkout it belongs to. */
+  async recordRefund(refundId: string, paymentId: string, status: "refunded" | "failed") {
+    const note = status === "refunded" ? "Refunded by Razorpay." : "Razorpay could not complete the refund. Retry it from the order.";
+    const orders = await this.prisma.order.updateMany({ where: { razorpayPaymentId: paymentId }, data: { refundStatus: status, refundId, refundNote: note } });
+    if (orders.count === 0) await this.prisma.paymentCheckout.updateMany({ where: { paymentId }, data: { refundStatus: status, refundId } });
   }
 
   async place(input: PlaceInput, options?: { trustedPayment?: boolean }) {
@@ -99,17 +137,48 @@ export class OrdersService {
       const existing = await this.prisma.order.findUnique({ where: { id: prepared.existingOrderId } });
       if (existing) return this.present(existing);
     }
+    try {
+      return await this.createOrder(prepared, options?.trustedPayment);
+    } catch (error) {
+      // Only a payment we know is good, for an order that cannot be made, is refunded.
+      if (!prepared.razorpay || !(error instanceof BadRequestException) || error instanceof PaymentNotConfirmedException) throw error;
+      // Another request (the webhook or a retry) may have created the order for this payment.
+      const checkout = await this.prisma.paymentCheckout.findUnique({ where: { razorpayOrderId: prepared.razorpay.orderId } });
+      if (checkout?.orderId) {
+        const existing = await this.prisma.order.findUnique({ where: { id: checkout.orderId } });
+        if (existing) return this.present(existing);
+      }
+      // The customer paid, but the order cannot be made (stock sold out, price or coupon changed). Give the money back.
+      const reason = error.message;
+      const refund = await this.failPaidCheckout(prepared.razorpay.orderId, prepared.razorpay.paymentId, reason);
+      const amount = `₹${((checkout?.amountPaise ?? 0) / 100).toLocaleString("en-IN")}`;
+      throw new BadRequestException(
+        refund === "failed"
+          ? `${reason} We could not place your order, and your payment of ${amount} needs a refund. The studio has been told and will refund it.`
+          : `${reason} We could not place your order, so your payment of ${amount} has been refunded. It reaches your account in 5–7 working days.`,
+      );
+    }
+  }
+
+  private async createOrder(prepared: Prepared, trustedPayment?: boolean) {
     const email = prepared.email.trim().toLowerCase();
     const customer = await this.prisma.customer.findUnique({ where: { email } });
     if (customer?.blocked) throw new BadRequestException("This account is blocked and cannot place an order.");
     const quoted = await this.quote({ ...prepared, email });
-    if (prepared.payment !== "cod" && !this.payments.configured()) {
-      console.log(`[pay] Razorpay is not configured. Recorded ${prepared.payment} for ${email} without a charge.`);
+    if (prepared.razorpay) {
+      if (quoted.total * 100 !== prepared.amountPaise) throw new BadRequestException("The price of your bag changed while you were paying.");
+      // The webhook only fires for captured payments; the browser's proof is checked with Razorpay.
+      if (!trustedPayment) await this.payments.ensureCaptured(prepared.razorpay.paymentId, prepared.razorpay.orderId, quoted.total * 100);
     }
+    // A ₹0 order skips payment; if the total rose in the meantime (a coupon ran out), it needs paying after all.
+    if (prepared.paymentStatus === "free" && quoted.total > 0) throw new BadRequestException("Your total changed. Place the order again to pay.");
+    const paymentStatus: PaymentStatus = prepared.paymentStatus;
 
-    let order;
-    try {
-      order = await this.prisma.$transaction(async (tx) => {
+    const order = await this.prisma.$transaction(async (tx) => {
+      // Lock each product row (in a fixed order, so two orders cannot deadlock) so simultaneous orders cannot oversell.
+      for (const slug of [...new Set(quoted.items.map((item) => item.slug))].sort()) {
+        await tx.$queryRaw`SELECT slug FROM "Product" WHERE slug = ${slug} FOR UPDATE`;
+      }
       for (const item of quoted.items) {
         const product = await tx.product.findUnique({ where: { slug: item.slug } });
         const stock = { ...(product!.stock as Record<string, number>) };
@@ -122,14 +191,16 @@ export class OrdersService {
       const sequence = await tx.sequence.update({ where: { id: "order" }, data: { value: { increment: 1 } } });
       const created = await tx.order.create({
         data: {
-          id: `order-${Date.now()}`,
+          id: `order-${Date.now()}-${randomBytes(3).toString("hex")}`,
           number: `EA-${sequence.value}`,
           email,
-          phone: prepared.phone,
-          address: prepared.address as Prisma.InputJsonValue,
+          phone: quoted.phone,
+          address: quoted.address as Prisma.InputJsonValue,
           items: quoted.items.map(({ stockKey: _stockKey, ...item }) => item) as Prisma.InputJsonValue,
           delivery: prepared.delivery,
           payment: prepared.payment,
+          paymentStatus,
+          accessKey: randomBytes(16).toString("hex"),
           subtotal: quoted.subtotal,
           discount: quoted.discount,
           shipping: quoted.shipping,
@@ -144,7 +215,11 @@ export class OrdersService {
           customerId: customer?.id,
         },
       });
-      if (quoted.couponCode) await tx.coupon.update({ where: { code: quoted.couponCode }, data: { used: { increment: 1 } } });
+      if (quoted.couponCode) {
+        // Counted only while under its limit, so two last-minute orders cannot both use a coupon's final use.
+        const counted = await tx.$executeRaw`UPDATE "Coupon" SET used = used + 1 WHERE code = ${quoted.couponCode} AND ("usageLimit" = 0 OR used < "usageLimit")`;
+        if (counted === 0) throw new BadRequestException("That coupon has reached its usage limit.");
+      }
       if (prepared.razorpay) {
         const claimed = await tx.paymentCheckout.updateMany({
           where: { razorpayOrderId: prepared.razorpay.orderId, usedAt: null },
@@ -154,24 +229,57 @@ export class OrdersService {
       }
       return created;
     });
-    } catch (error) {
-      if (prepared.razorpay && error instanceof BadRequestException) {
-        const checkout = await this.prisma.paymentCheckout.findUnique({ where: { razorpayOrderId: prepared.razorpay.orderId } });
-        if (checkout?.orderId) {
-          const existing = await this.prisma.order.findUnique({ where: { id: checkout.orderId } });
-          if (existing) return this.present(existing);
-        }
-      }
-      throw error;
-    }
 
-    await this.notify("confirmed", order);
+    this.notify("confirmed", order);
     return this.present(order);
   }
 
-  async cancel(id: string, email?: string) {
+  /** Refunds a verified payment that could not become an order, once, and records why. */
+  private async failPaidCheckout(razorpayOrderId: string, paymentId: string, reason: string) {
+    const checkout = await this.prisma.paymentCheckout.findUnique({ where: { razorpayOrderId } });
+    if (!checkout) return "failed" as const;
+    if (checkout.refundStatus === "pending" || checkout.refundStatus === "refunded") return checkout.refundStatus;
+    const refund = await this.payments.refund(paymentId, checkout.amountPaise);
+    await this.prisma.paymentCheckout.update({
+      where: { razorpayOrderId },
+      data: { failedReason: reason, paymentId, refundId: refund.id, refundStatus: refund.status },
+    });
+    return refund.status;
+  }
+
+  /**
+   * Refunds a paid order in full, at most once. Demo, free, and cash orders have nothing to refund.
+   * A failed refund is recorded so staff can see it and retry.
+   */
+  async refundOrder(id: string) {
     const order = await this.mustGet(id);
-    if (email && order.email !== email.toLowerCase()) throw new NotFoundException("Order not found.");
+    if (order.paymentStatus !== "paid" || !order.razorpayPaymentId) return this.present(order);
+    if (order.refundStatus === "pending" || order.refundStatus === "refunded") return this.present(order);
+    const refund = await this.payments.refund(order.razorpayPaymentId, order.total * 100);
+    const updated = await this.prisma.order.update({
+      where: { id },
+      data: { refundStatus: refund.status, refundId: refund.id ?? order.refundId, refundNote: refund.note },
+    });
+    return this.present(updated);
+  }
+
+  /** Staff retry for a refund that failed. */
+  async retryRefund(id: string) {
+    const order = await this.mustGet(id);
+    if (order.refundStatus !== "failed") throw new BadRequestException("Only a failed refund can be retried.");
+    if (!["Cancelled", "Returned"].includes(order.status)) throw new BadRequestException("Only cancelled or returned orders are refunded.");
+    return this.refundOrder(id);
+  }
+
+  private requireOnlinePayments() {
+    if (this.payments.mode() === "off") {
+      throw new BadRequestException("Online payment is not available yet. Choose cash on delivery.");
+    }
+  }
+
+  // Callers check who may act on the order (OrdersController.authorize).
+  async cancel(id: string) {
+    const order = await this.mustGet(id);
     if (["Shipped", "Out for delivery", "Delivered", "Cancelled", "Returned", "Return requested"].includes(order.status)) {
       throw new BadRequestException("This order can no longer be cancelled.");
     }
@@ -186,14 +294,13 @@ export class OrdersService {
         },
       });
     });
-    await this.notify("cancelled", updated);
-    if (updated.payment !== "cod" && updated.razorpayPaymentId) await this.payments.refund(updated.razorpayPaymentId, updated.total * 100);
-    return this.present(updated);
+    const result = await this.refundOrder(updated.id);
+    this.notify("cancelled", await this.mustGet(updated.id));
+    return result;
   }
 
-  async requestReturn(id: string, email: string | undefined, request: Record<string, unknown>) {
+  async requestReturn(id: string, request: Record<string, unknown>) {
     const order = await this.mustGet(id);
-    if (email && order.email !== email.toLowerCase()) throw new NotFoundException("Order not found.");
     if (order.status !== "Delivered") throw new BadRequestException("Returns open after delivery.");
     const rules = await this.settings();
     const delivered = (order.timeline as { status: string; date: string }[]).find((event) => event.status === "Delivered");
@@ -207,7 +314,7 @@ export class OrdersService {
         returnRequest: { ...request, status: request.status ?? "Awaiting review", requestedAt: new Date().toISOString() },
       },
     });
-    await this.notify("return-requested", updated);
+    this.notify("return-requested", updated);
     return this.present(updated);
   }
 
@@ -215,7 +322,13 @@ export class OrdersService {
     const order = await this.mustGet(id);
     const timeline = order.timeline as { status: string; date: string }[];
     const statusChanged = Boolean(patch.status && patch.status !== order.status);
-    const release = statusChanged && patch.status === "Cancelled" && ["Confirmed", "Packed"].includes(order.status);
+    if (statusChanged && !(NEXT_STATUS[order.status] ?? []).includes(patch.status!)) {
+      const next = NEXT_STATUS[order.status] ?? [];
+      throw new BadRequestException(
+        next.length ? `A ${order.status.toLowerCase()} order can move to ${next.join(", ")}.` : `A ${order.status.toLowerCase()} order cannot change status here.`,
+      );
+    }
+    const release = statusChanged && patch.status === "Cancelled";
     const updated = await this.prisma.$transaction(async (tx) => {
       if (release) {
         await this.restock(tx, order.items);
@@ -231,16 +344,18 @@ export class OrdersService {
       });
     });
     const kind = statusMail(updated.status);
-    if (statusChanged && kind) await this.notify(kind, updated);
-    if (statusChanged && updated.status === "Cancelled" && updated.payment !== "cod" && updated.razorpayPaymentId) {
-      await this.payments.refund(updated.razorpayPaymentId, updated.total * 100);
+    if (statusChanged && updated.status === "Cancelled") {
+      const result = await this.refundOrder(updated.id);
+      this.notify("cancelled", await this.mustGet(updated.id));
+      return result;
     }
+    if (statusChanged && kind) this.notify(kind, updated);
     return this.present(updated);
   }
 
   async ship(id: string, shipment: { courier: string; tracking: string }) {
     const order = await this.mustGet(id);
-    if (["Cancelled", "Returned"].includes(order.status)) throw new BadRequestException("This order cannot be shipped.");
+    if (!["Confirmed", "Packed", "Shipped"].includes(order.status)) throw new BadRequestException(`A ${order.status.toLowerCase()} order cannot be shipped.`);
     const alreadyShipped = order.status === "Shipped";
     const updated = await this.prisma.order.update({
       where: { id },
@@ -251,7 +366,7 @@ export class OrdersService {
         timeline: [...(order.timeline as { status: string; date: string }[]), { status: "Shipped", date: new Date().toISOString() }],
       },
     });
-    if (!alreadyShipped) await this.notify("shipped", updated);
+    if (!alreadyShipped) this.notify("shipped", updated);
     return this.present(updated);
   }
 
@@ -259,6 +374,7 @@ export class OrdersService {
     const order = await this.mustGet(id);
     const request = order.returnRequest as { resolution?: string; status?: string } | null;
     if (!request) throw new BadRequestException("There is no return request on this order.");
+    if (order.status !== "Return requested") throw new BadRequestException("This return has already been decided.");
     const approvedRefund = decision === "Approved" && request.resolution === "refund";
     const updated = await this.prisma.$transaction(async (tx) => {
       if (approvedRefund && order.status !== "Returned") await this.restock(tx, order.items);
@@ -271,15 +387,21 @@ export class OrdersService {
       });
     });
     const kind: OrderMail = decision === "Rejected" ? "return-declined" : request.resolution === "exchange" ? "return-exchange" : approvedRefund ? "return-approved" : "returned";
-    await this.notify(kind, updated);
-    if (approvedRefund && order.status !== "Returned" && updated.payment !== "cod" && updated.razorpayPaymentId) {
-      await this.payments.refund(updated.razorpayPaymentId, updated.total * 100);
+    if (approvedRefund) {
+      const result = await this.refundOrder(updated.id);
+      this.notify(kind, await this.mustGet(updated.id));
+      return result;
     }
+    this.notify(kind, updated);
     return this.present(updated);
   }
 
   private async restock(tx: Prisma.TransactionClient, items: unknown) {
-    for (const item of (items as { slug?: string; color?: string; size?: string; quantity?: number }[]) ?? []) {
+    const lines = ((items as { slug?: string; color?: string; size?: string; quantity?: number }[]) ?? []).filter((item) => item.slug);
+    for (const slug of [...new Set(lines.map((item) => item.slug!))].sort()) {
+      await tx.$queryRaw`SELECT slug FROM "Product" WHERE slug = ${slug} FOR UPDATE`;
+    }
+    for (const item of lines) {
       if (!item.slug || !item.color || !item.size || !item.quantity) continue;
       const product = await tx.product.findUnique({ where: { slug: item.slug } });
       if (!product) continue;
@@ -320,6 +442,10 @@ export class OrdersService {
     trackingUrl: string | null;
     shipment: unknown;
     returnRequest: unknown;
+    paymentStatus?: string;
+    refundStatus?: string;
+    refundNote?: string;
+    accessKey?: string;
   }) {
     return {
       ...order,
@@ -332,24 +458,32 @@ export class OrdersService {
     };
   }
 
-  private async paidInput(input: PlaceInput, trusted?: boolean): Promise<PlaceInput & { existingOrderId?: string }> {
-    if (input.payment === "cod" || !this.payments.configured()) return { ...input, razorpay: undefined };
+  private async paidInput(input: PlaceInput, trusted?: boolean): Promise<Prepared> {
+    if (input.payment === "cod") return { ...input, razorpay: undefined, paymentStatus: "cod" };
+    this.requireOnlinePayments();
+    if (this.payments.mode() === "demo") return { ...input, razorpay: undefined, paymentStatus: "demo" };
     const proof = input.razorpay;
-    if (!proof?.orderId || !proof.paymentId) throw new BadRequestException("Payment was not completed.");
+    if (!proof?.orderId || !proof.paymentId) {
+      // A ₹0 order (a full coupon) has nothing to charge.
+      if ((await this.quote(input)).total === 0) return { ...input, razorpay: undefined, paymentStatus: "free" };
+      throw new BadRequestException("Payment was not completed.");
+    }
     if (!trusted && !this.payments.verifyPayment(proof.orderId, proof.paymentId, proof.signature || "")) {
       throw new BadRequestException("Payment could not be verified.");
     }
     const checkout = await this.prisma.paymentCheckout.findUnique({ where: { razorpayOrderId: proof.orderId } });
     if (!checkout) throw new BadRequestException("Payment could not be verified.");
+    // The order is built from what was stored when payment began, never from what the browser sends now.
     const stored = checkout.payload as PlaceInput;
     if (checkout.usedAt && checkout.orderId) {
       const existing = await this.prisma.order.findUnique({ where: { id: checkout.orderId } });
-      if (existing) return { ...stored, email: stored.email, razorpay: proof, existingOrderId: existing.id };
+      if (existing) return { ...stored, razorpay: proof, paymentStatus: "paid", existingOrderId: existing.id };
     }
     if (checkout.usedAt) throw new BadRequestException("This payment has already been used.");
-    const quoted = await this.quote(stored);
-    if (quoted.total * 100 !== checkout.amountPaise) throw new BadRequestException("The payment amount does not match this order.");
-    return { ...stored, email: stored.email, razorpay: proof };
+    if (checkout.failedReason) {
+      throw new BadRequestException(`${checkout.failedReason} This payment ${checkout.refundStatus === "failed" ? "is waiting for a refund from the studio" : "has been refunded"}.`);
+    }
+    return { ...stored, razorpay: proof, paymentStatus: "paid", amountPaise: checkout.amountPaise };
   }
 
   private async quote(input: PlaceInput) {
@@ -358,11 +492,14 @@ export class OrdersService {
       throw new BadRequestException("Choose UPI, card, net banking, or cash on delivery.");
     }
     const rules = await this.settings();
+    // Before anything is priced or paid for: a real PIN, the right state for it, and a state the studio delivers to.
+    const address = checkDeliveryAddress(input.address, rules);
+    const phone = cleanMobile(input.phone);
     const items = [];
     for (const item of input.items) {
       if (!Number.isInteger(item.quantity) || item.quantity < 1) throw new BadRequestException("Choose a quantity of at least 1.");
       const product = await this.prisma.product.findUnique({ where: { slug: item.slug } });
-      if (!product || product.status !== "active") throw new BadRequestException(`${item.slug} is no longer available.`);
+      if (!product || !(await isOnSale(this.prisma, product))) throw new BadRequestException(`${item.slug} is no longer available.`);
       const stock = product.stock as Record<string, number>;
       const key = `${item.color}|${item.size}`;
       if ((stock[key] ?? 0) < item.quantity) {
@@ -399,13 +536,21 @@ export class OrdersService {
     if (input.payment === "cod" && total > Number(rules.codMax)) {
       throw new BadRequestException(`Cash on delivery is available on orders up to ₹${Number(rules.codMax).toLocaleString("en-IN")}.`);
     }
-    return { items, subtotal, discount, shipping, codFee, total, couponCode: coupon?.code };
+    return { items, subtotal, discount, shipping, codFee, total, couponCode: coupon?.code, address, phone };
   }
 
-  private async notify(kind: OrderMail, order: Parameters<OrdersService["toMail"]>[0] & { phone: string }) {
+  /**
+   * Email and WhatsApp go out in the background: a slow provider never holds up checkout or the admin,
+   * and a failure is logged without undoing the order change that caused it.
+   */
+  private notify(kind: OrderMail, order: Parameters<OrdersService["toMail"]>[0] & { phone: string; paymentStatus?: string; refundStatus?: string }) {
     const message = this.toMail(order);
-    await this.mail.order(kind, message);
-    await this.whatsapp.order(kind, { ...message, phone: order.phone });
+    void Promise.allSettled([
+      this.mail.order(kind, message),
+      this.whatsapp.order(kind, { ...message, phone: order.phone, paymentStatus: order.paymentStatus, refundStatus: order.refundStatus }),
+    ]).then((results) => {
+      for (const result of results) if (result.status === "rejected") console.error(`[notify] “${kind}” for ${order.number} failed`, result.reason);
+    });
   }
 
   private toMail(order: {
@@ -419,7 +564,7 @@ export class OrdersService {
     trackingUrl: string | null;
     shipment: unknown;
   }): MailOrder {
-    const address = (order.address ?? {}) as { name?: string; line1?: string; line2?: string; city?: string; state?: string; pin?: string };
+    const address = (order.address ?? {}) as { name?: string; line1?: string; line2?: string; landmark?: string; city?: string; state?: string; pin?: string };
     const shipment = (order.shipment ?? {}) as { courier?: string; tracking?: string };
     const place = [address.city, address.state].filter(Boolean).join(", ");
     return {
@@ -430,7 +575,7 @@ export class OrdersService {
       total: order.total,
       payment: order.payment,
       delivery: order.delivery,
-      lines: [address.line1, address.line2, [place, address.pin].filter(Boolean).join(" ")].filter((line): line is string => Boolean(line)),
+      lines: [address.line1, address.line2, address.landmark ? `Near ${address.landmark}` : "", [place, address.pin].filter(Boolean).join(" ")].filter((line): line is string => Boolean(line)),
       courier: shipment.courier,
       tracking: shipment.tracking,
       trackingUrl: order.trackingUrl || undefined,
