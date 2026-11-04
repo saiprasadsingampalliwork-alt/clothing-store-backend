@@ -25,7 +25,8 @@ This is `DATABASE_URL`. Keep it private.
 2. On the dashboard, find **API environment variable**. It looks like
    `cloudinary://123456789012345:abcdEFGH…@your-cloud-name`.
 
-This is `CLOUDINARY_URL`. Keep it private.
+This is `CLOUDINARY_URL`. Keep it private. (Or set the three values the dashboard lists separately:
+`CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET`. A secret on its own is not enough.)
 
 ## 3. API: create the Render service from the blueprint
 
