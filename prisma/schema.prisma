@@ -19,6 +19,9 @@ model Customer {
   wishlist            Json      @default("[]")
   cartUpdatedAt       DateTime?
   wishlistUpdatedAt   DateTime?
+  // Bag and wishlist reminders are marketing messages: sent only after the customer opts in, and stopped by "STOP".
+  whatsappOptIn       Boolean   @default(false)
+  whatsappOptInAt     DateTime?
   cartRemindedKey     String    @default("")
   wishlistRemindedKey String    @default("")
   createdAt           DateTime  @default(now())
@@ -34,6 +37,33 @@ model Category {
   sort  Int    @default(0)
 }
 
+// Who a product is for: Women, Men, Girls, Baby, and so on. Product.gender holds the audience slug.
+// A shared audience (Unisex, Kids unisex) shows under every audience in the same group.
+model Audience {
+  slug   String  @id
+  label  String
+  group  String  @default("adults")
+  shared Boolean @default(false)
+  sizes  Json
+  active Boolean @default(true)
+  sort   Int     @default(0)
+}
+
+// Materials staff pick from on products. Product.fabric holds the label; Product.fabricDetail the weight, like "160 gsm".
+model Fabric {
+  slug  String @id
+  label String @unique
+}
+
+// Occasions or looks (Casual, Formal, Ethnic…) that cut across categories and audiences.
+// Product.styles holds style slugs, so renaming a style never touches products.
+model Style {
+  slug   String  @id
+  label  String  @unique
+  active Boolean @default(true)
+  sort   Int     @default(0)
+}
+
 model Product {
   slug            String  @id
   name            String
@@ -41,6 +71,8 @@ model Product {
   category        String
   gender          String  @default("unisex")
   fabric          String
+  fabricDetail    String  @default("")
+  styles          String[] @default([])
   description     String
   details         Json
   care            Json
@@ -88,6 +120,14 @@ model Order {
   returnRequest     Json?
   razorpayOrderId   String?
   razorpayPaymentId String?
+  // cod, paid (charged by Razorpay), demo (online order with no charge), or free (nothing to charge).
+  paymentStatus     String    @default("")
+  // "", pending, refunded, or failed. A refund is only ever started once per order.
+  refundStatus      String    @default("")
+  refundId          String?
+  refundNote        String    @default("")
+  // Lets a guest open, cancel, or return their own order without an account.
+  accessKey         String    @default("")
   customerId        String?
   customer          Customer? @relation(fields: [customerId], references: [id])
 }
@@ -100,6 +140,10 @@ model PaymentCheckout {
   paymentId       String?
   orderId         String?
   usedAt          DateTime?
+  // Set when a verified payment could not become an order; the payment is then refunded.
+  failedReason    String?
+  refundId        String?
+  refundStatus    String?
   createdAt       DateTime  @default(now())
 }
 

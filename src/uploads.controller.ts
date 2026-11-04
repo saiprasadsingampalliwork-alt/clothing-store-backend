@@ -1,23 +1,38 @@
-import { BadRequestException, Body, Controller, Post, Req, UnauthorizedException } from "@nestjs/common";
+import { BadRequestException, Body, Controller, Inject, Post, Req } from "@nestjs/common";
 import { randomBytes } from "crypto";
 import type { Request } from "express";
 import { mkdir, writeFile } from "fs/promises";
 import path from "path";
-import { actorFrom } from "./auth";
+import { requireCatalogStaff } from "./auth";
+import { cloudinaryAccount, uploadToCloudinary } from "./cloudinary";
+import { PrismaService } from "./prisma.service";
 
 const MAX_BYTES = 6 * 1024 * 1024;
 
+// Photos live on the API server and are served from /uploads by main.ts.
+export const UPLOAD_DIR = path.resolve(process.env.UPLOAD_DIR || path.resolve(__dirname, "../uploads"));
+
 @Controller("uploads")
 export class UploadsController {
+  constructor(@Inject(PrismaService) private readonly prisma: PrismaService) {}
+
   @Post()
   async create(@Req() req: Request, @Body() body: { data?: string }) {
-    const actor = actorFrom(req);
-    if (!actor || actor.kind !== "staff") throw new UnauthorizedException("Staff sign-in is required.");
+    await requireCatalogStaff(req, this.prisma);
     const parsed = decodeImage(body.data ?? "");
-    const name = `photo-${Date.now()}-${randomBytes(4).toString("hex")}.${parsed.ext}`;
-    const dir = path.resolve(__dirname, "../../public/uploads");
-    await mkdir(dir, { recursive: true });
-    await writeFile(path.join(dir, name), parsed.bytes);
+    const id = `photo-${Date.now()}-${randomBytes(4).toString("hex")}`;
+    // On hosts without a lasting disk (Render's free plan), photos must live on Cloudinary.
+    if (cloudinaryAccount()) {
+      try {
+        return { url: await uploadToCloudinary(parsed.bytes, parsed.ext, id) };
+      } catch (error) {
+        console.error("[uploads] Cloudinary upload failed", error);
+        throw new BadRequestException("The photo could not be stored. Try again in a moment.");
+      }
+    }
+    const name = `${id}.${parsed.ext}`;
+    await mkdir(UPLOAD_DIR, { recursive: true });
+    await writeFile(path.join(UPLOAD_DIR, name), parsed.bytes);
     return { url: `/uploads/${name}` };
   }
 }

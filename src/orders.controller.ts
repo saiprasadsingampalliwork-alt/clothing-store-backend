@@ -1,5 +1,6 @@
-import { Body, Controller, Get, Inject, NotFoundException, Param, Patch, Post, Req, UnauthorizedException } from "@nestjs/common";
+import { Body, Controller, Get, Headers, Inject, NotFoundException, Param, Patch, Post, Req, UnauthorizedException } from "@nestjs/common";
 import type { Request } from "express";
+import { timingSafeEqual } from "crypto";
 import { actorFrom, customerFrom } from "./auth";
 import { OrdersService } from "./orders.service";
 import { PrismaService } from "./prisma.service";
@@ -25,10 +26,8 @@ export class OrdersController {
   }
 
   @Get(":id")
-  async one(@Param("id") id: string) {
-    const order = await this.prisma.order.findUnique({ where: { id } });
-    if (!order) throw new NotFoundException("Order not found.");
-    return this.orders.present(order);
+  async one(@Req() req: Request, @Param("id") id: string, @Headers("x-order-key") key?: string) {
+    return this.orders.present(await this.authorize(req, id, key));
   }
 
   @Post()
@@ -37,16 +36,15 @@ export class OrdersController {
   }
 
   @Post(":id/cancel")
-  cancel(@Req() req: Request, @Param("id") id: string) {
-    const staff = actorFrom(req);
-    const customer = customerFrom(req);
-    return this.orders.cancel(id, staff?.kind === "staff" ? undefined : customer?.email);
+  async cancel(@Req() req: Request, @Param("id") id: string, @Headers("x-order-key") key?: string) {
+    await this.authorize(req, id, key);
+    return this.orders.cancel(id);
   }
 
   @Post(":id/return")
-  requestReturn(@Req() req: Request, @Param("id") id: string, @Body() body: Record<string, unknown>) {
-    const customer = customerFrom(req);
-    return this.orders.requestReturn(id, customer?.email, body);
+  async requestReturn(@Req() req: Request, @Param("id") id: string, @Body() body: Record<string, unknown>, @Headers("x-order-key") key?: string) {
+    await this.authorize(req, id, key);
+    return this.orders.requestReturn(id, body);
   }
 
   @Patch(":id")
@@ -67,8 +65,34 @@ export class OrdersController {
     return this.orders.decideReturn(id, body.decision);
   }
 
+  @Post(":id/refund")
+  retryRefund(@Req() req: Request, @Param("id") id: string) {
+    this.requireStaff(req);
+    return this.orders.retryRefund(id);
+  }
+
+  /**
+   * Staff, the signed-in customer who placed the order, or anyone holding the order's access key
+   * (a guest's browser keeps it). Everyone else gets "not found", so order numbers cannot be probed.
+   */
+  private async authorize(req: Request, id: string, key?: string) {
+    const order = await this.prisma.order.findUnique({ where: { id } });
+    if (!order) throw new NotFoundException("Order not found.");
+    if (actorFrom(req)?.kind === "staff") return order;
+    const customer = customerFrom(req);
+    if (customer?.kind === "customer" && customer.email.toLowerCase() === order.email.toLowerCase()) return order;
+    if (key && order.accessKey && sameKey(key, order.accessKey)) return order;
+    throw new NotFoundException("Order not found.");
+  }
+
   private requireStaff(req: Request) {
     const actor = actorFrom(req);
     if (!actor || actor.kind !== "staff") throw new UnauthorizedException("Staff sign-in is required.");
   }
+}
+
+function sameKey(left: string, right: string) {
+  const a = Buffer.from(left);
+  const b = Buffer.from(right);
+  return a.length === b.length && timingSafeEqual(a, b);
 }

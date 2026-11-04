@@ -1,6 +1,10 @@
 import { hash } from "bcryptjs";
 import { PrismaClient, type Prisma } from "@prisma/client";
 import { DEFAULT_CATEGORIES, productGender, products } from "../../lib/catalog";
+import { DEFAULT_AUDIENCES } from "../src/audiences";
+import { cleanFabricLabel, freeSlug, splitFabric } from "../src/fabrics";
+import { DEFAULT_STYLES } from "../src/styles";
+import { categorySlug } from "../src/category-slug";
 
 const prisma = new PrismaClient();
 
@@ -29,6 +33,12 @@ const settings = {
 };
 
 async function main() {
+  for (const [sort, label] of DEFAULT_STYLES.entries()) {
+    await prisma.style.upsert({ where: { label }, create: { slug: categorySlug(label), label, sort }, update: {} });
+  }
+  for (const audience of DEFAULT_AUDIENCES) {
+    await prisma.audience.upsert({ where: { slug: audience.slug }, create: { ...audience, sizes: audience.sizes as string[] }, update: {} });
+  }
   for (const [index, category] of DEFAULT_CATEGORIES.entries()) {
     await prisma.category.upsert({
       where: { slug: category.slug },
@@ -38,6 +48,9 @@ async function main() {
   }
 
   for (const product of products) {
+    const { fabric, detail } = splitFabric(product.fabric);
+    const fabricLabel = cleanFabricLabel(fabric);
+    await prisma.fabric.upsert({ where: { label: fabricLabel }, create: { slug: await freeSlug(prisma, fabricLabel), label: fabricLabel }, update: {} });
     await prisma.product.upsert({
       where: { slug: product.slug },
       create: {
@@ -46,7 +59,9 @@ async function main() {
         price: product.price,
         category: product.category,
         gender: productGender(product),
-        fabric: product.fabric,
+        fabric: fabricLabel,
+        fabricDetail: detail,
+        styles: ["casual"],
         description: product.description,
         details: product.details,
         care: product.care,

@@ -1,3 +1,7 @@
 node_modules
 dist
 .env
+
+# Uploaded product photos are stored on the server, not in the repo
+uploads/*
+!uploads/.gitkeep
