@@ -44,7 +44,7 @@ function replaced<T>(value: T, map: Map<string, string>): T {
 async function main() {
   // Connecting first also loads server/.env, where CLOUDINARY_URL usually lives.
   await prisma.$connect();
-  if (!cloudinaryAccount()) throw new Error("Set CLOUDINARY_URL (cloudinary://<api_key>:<api_secret>@<cloud_name>) first.");
+  if (!cloudinaryAccount()) throw new Error("Set CLOUDINARY_URL (cloudinary://<api_key>:<api_secret>@<cloud_name>), or CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET, first.");
   const [products, categories, settings] = await Promise.all([
     prisma.product.findMany({ select: { slug: true, photos: true } }),
     prisma.category.findMany({ select: { slug: true, image: true } }),
