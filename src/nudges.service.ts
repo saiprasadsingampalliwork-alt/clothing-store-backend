@@ -56,9 +56,12 @@ export class NudgesService implements OnModuleInit, OnModuleDestroy {
 
   onModuleInit() {
     void this.remindDue();
+    // Every 10 minutes by default: reminders are due an hour after a change, so this is precise enough
+    // and keeps database use low on free plans (each check is a query once WhatsApp is set up).
+    const minutes = Math.max(1, Number(process.env.NUDGE_CHECK_MINUTES ?? 10) || 10);
     this.timer = setInterval(() => {
       void this.remindDue();
-    }, 60_000);
+    }, minutes * 60_000);
     this.timer.unref?.();
   }
 

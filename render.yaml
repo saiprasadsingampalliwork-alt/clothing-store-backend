@@ -1,0 +1,52 @@
+# Render Blueprint for the Earthen API, on Render's free plan.
+# Render dashboard → New → Blueprint → pick this repository. Fill in the values marked "sync: false" when asked.
+#
+# Free plan notes:
+# - The service sleeps after 15 minutes without requests; a free uptime pinger on /v1/health keeps it awake.
+# - There is no lasting disk, so photos go to Cloudinary (CLOUDINARY_URL) and the database is external (Prisma Postgres or Neon).
+services:
+  - type: web
+    name: clothing-store-backend
+    runtime: node
+    plan: free
+    region: singapore
+    branch: main
+    # Dev dependencies (tsx, prisma) are needed to run the TypeScript API and apply the schema.
+    buildCommand: npm ci --include=dev && npx prisma generate
+    # Applies schema changes (additive only; it stops rather than drop data), then starts the API.
+    startCommand: npx prisma db push --skip-generate && npm start
+    healthCheckPath: /v1/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: DATABASE_URL
+        sync: false # Prisma Postgres direct connection string (postgres://…@db.prisma.io:5432/…?sslmode=require)
+      - key: TOKEN_SECRET
+        generateValue: true # signs logins; generated once, keep it secret
+      - key: APP_URL
+        sync: false # the storefront, e.g. https://clothing-store-yem9-delta.vercel.app
+      - key: CORS_ORIGINS
+        sync: false # other storefront addresses, comma-separated (optional)
+      - key: TRUST_PROXY
+        value: "1"
+      - key: CLOUDINARY_URL
+        sync: false # cloudinary://<api_key>:<api_secret>@<cloud_name>
+      - key: PAYMENTS_DEMO
+        sync: false # true only for a demo store: online orders complete without payment
+      - key: MESSAGES_DEMO
+        value: "false" # never true on a public site: it shows sign-in codes on screen
+      - key: NOMINATIM_CONTACT
+        sync: false # an email or the shop URL, for OpenStreetMap's usage policy
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: SMTP_FROM
+        sync: false
+      - key: STUDIO_INBOX_EMAIL
+        sync: false

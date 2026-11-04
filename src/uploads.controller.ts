@@ -4,6 +4,7 @@ import type { Request } from "express";
 import { mkdir, writeFile } from "fs/promises";
 import path from "path";
 import { requireCatalogStaff } from "./auth";
+import { cloudinaryAccount, uploadToCloudinary } from "./cloudinary";
 import { PrismaService } from "./prisma.service";
 
 const MAX_BYTES = 6 * 1024 * 1024;
@@ -19,7 +20,17 @@ export class UploadsController {
   async create(@Req() req: Request, @Body() body: { data?: string }) {
     await requireCatalogStaff(req, this.prisma);
     const parsed = decodeImage(body.data ?? "");
-    const name = `photo-${Date.now()}-${randomBytes(4).toString("hex")}.${parsed.ext}`;
+    const id = `photo-${Date.now()}-${randomBytes(4).toString("hex")}`;
+    // On hosts without a lasting disk (Render's free plan), photos must live on Cloudinary.
+    if (cloudinaryAccount()) {
+      try {
+        return { url: await uploadToCloudinary(parsed.bytes, parsed.ext, id) };
+      } catch (error) {
+        console.error("[uploads] Cloudinary upload failed", error);
+        throw new BadRequestException("The photo could not be stored. Try again in a moment.");
+      }
+    }
+    const name = `${id}.${parsed.ext}`;
     await mkdir(UPLOAD_DIR, { recursive: true });
     await writeFile(path.join(UPLOAD_DIR, name), parsed.bytes);
     return { url: `/uploads/${name}` };

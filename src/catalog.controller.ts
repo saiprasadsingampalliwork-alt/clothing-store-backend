@@ -478,7 +478,7 @@ function cleanPhotos(value: unknown) {
   for (const item of value) {
     if (!item || typeof item !== "object") continue;
     const src = String((item as { src?: string }).src ?? "").trim();
-    if ((!src.startsWith("/photos/") && !src.startsWith("/uploads/")) || src.includes("..")) continue;
+    if (!isPhotoSrc(src)) continue;
     photos.push({
       id: String((item as { id?: string }).id ?? "").replace(/[^\w-]/g, "").slice(0, 40) || `photo-${photos.length + 1}`,
       label: String((item as { label?: string }).label ?? "Photo").trim().slice(0, 40) || "Photo",
@@ -599,4 +599,10 @@ function nextStats(rating: number, count: number, previous: number | null, stars
   }
   const reviewCount = count > 0 ? count : 1;
   return { rating: Math.round(((rating * reviewCount - previous + stars) / reviewCount) * 10) / 10, reviewCount };
+}
+
+/** Our own photos (/photos, /uploads) or images on Cloudinary; nothing else is shown as a product photo. */
+export function isPhotoSrc(src: string) {
+  if (src.includes("..")) return false;
+  return src.startsWith("/photos/") || src.startsWith("/uploads/") || /^https:\/\/res\.cloudinary\.com\/[a-z0-9_-]+\/image\/upload\/[A-Za-z0-9_.\/,-]+$/i.test(src);
 }
